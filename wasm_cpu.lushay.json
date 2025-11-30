@@ -1,0 +1,17 @@
+{
+  "name": "wasm_cpu",
+  "top": "top",
+  "constraintsFile": "tangnano9k.cst",
+  "includedFiles": [
+    "top.v",
+    "stack_cpu.v",
+    "uart_tx.v",
+    "flash.v"
+  ],
+  "externalFlashFiles": [
+    "programs/demo.bin"
+  ],
+  "programMode": "flash",
+  "board": "tangnano9k",
+  "baudRate": 115200
+}
