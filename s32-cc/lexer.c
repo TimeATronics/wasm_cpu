@@ -111,6 +111,30 @@ static bool process_define(Lexer *lex) {
 
 static void skip_whitespace_and_comments(Lexer *lex) {
     for (;;) {
+        /* When in a skipped #ifdef block, consume all non-# content until #endif */
+        if (lex->skip_depth > 0) {
+            /* Consume characters until newline or # */
+            while (peek_ch(lex) && peek_ch(lex) != '\n' && peek_ch(lex) != '#') next_ch(lex);
+            if (peek_ch(lex) == '\n') { next_ch(lex); continue; }
+            /* # at column 1: process as directive */
+            if (peek_ch(lex) == '#' && lex->col == 1) {
+                next_ch(lex);
+                while (peek_ch(lex) && isspace((unsigned char)peek_ch(lex)) && peek_ch(lex) != '\n') next_ch(lex);
+                if (lex->buf_pos + 4 < lex->buf_len && memcmp(lex->buf + lex->buf_pos, "ifdef", 5) == 0) {
+                    lex->skip_depth++; /* nested */
+                } else if (lex->buf_pos + 5 < lex->buf_len && memcmp(lex->buf + lex->buf_pos, "ifndef", 6) == 0) {
+                    lex->skip_depth++;
+                } else if (lex->buf_pos + 4 < lex->buf_len && memcmp(lex->buf + lex->buf_pos, "endif", 5) == 0) {
+                    lex->skip_depth--;
+                }
+                while (peek_ch(lex) && peek_ch(lex) != '\n') next_ch(lex);
+                continue;
+            }
+            if (!peek_ch(lex)) break;
+            next_ch(lex);
+            continue;
+        }
+        
         char c = peek_ch(lex);
         if (c == 0) break;
         if (isspace(c)) { next_ch(lex); continue; }
@@ -235,9 +259,49 @@ static void skip_whitespace_and_comments(Lexer *lex) {
                 continue;
             }
             
-            /* Any other #directive: skip the line */
-            while (peek_ch(lex) && peek_ch(lex) != '\n') next_ch(lex);
-            continue;
+            /* Conditional compilation: #ifdef / #ifndef / #endif */
+            if (lex->buf_pos + 4 < lex->buf_len && !lex->skipping && 
+                memcmp(lex->buf + lex->buf_pos, "ifdef", 5) == 0) {
+                for (int i = 0; i < 5; i++) next_ch(lex);
+                while (peek_ch(lex) && isspace((unsigned char)peek_ch(lex)) && peek_ch(lex) != '\n') next_ch(lex);
+                char mname[256]; int mi = 0;
+                while (peek_ch(lex) && (isalnum((unsigned char)peek_ch(lex)) || peek_ch(lex) == '_'))
+                    mname[mi++] = next_ch(lex);
+                mname[mi] = 0;
+                if (!macro_get(mname)) lex->skip_depth++;
+                while (peek_ch(lex) && peek_ch(lex) != '\n') next_ch(lex);
+                continue;
+            }
+            if (lex->buf_pos + 5 < lex->buf_len && !lex->skipping &&
+                memcmp(lex->buf + lex->buf_pos, "ifndef", 6) == 0) {
+                for (int i = 0; i < 6; i++) next_ch(lex);
+                while (peek_ch(lex) && isspace((unsigned char)peek_ch(lex)) && peek_ch(lex) != '\n') next_ch(lex);
+                char mname[256]; int mi = 0;
+                while (peek_ch(lex) && (isalnum((unsigned char)peek_ch(lex)) || peek_ch(lex) == '_'))
+                    mname[mi++] = next_ch(lex);
+                mname[mi] = 0;
+                if (macro_get(mname)) lex->skip_depth++;
+                while (peek_ch(lex) && peek_ch(lex) != '\n') next_ch(lex);
+                continue;
+            }
+            if (lex->buf_pos + 4 < lex->buf_len &&
+                memcmp(lex->buf + lex->buf_pos, "endif", 5) == 0) {
+                for (int i = 0; i < 5; i++) next_ch(lex);
+                if (lex->skip_depth > 0) lex->skip_depth--;
+                while (peek_ch(lex) && peek_ch(lex) != '\n') next_ch(lex);
+                continue;
+            }
+            if (lex->buf_pos + 3 < lex->buf_len &&
+                memcmp(lex->buf + lex->buf_pos, "else", 4) == 0) {
+                for (int i = 0; i < 4; i++) next_ch(lex);
+                /* #else: flip skipping state */
+                if (lex->skip_depth == 1) lex->skip_depth = 0;
+                else if (lex->skip_depth == 0) lex->skip_depth = 1;
+                while (peek_ch(lex) && peek_ch(lex) != '\n') next_ch(lex);
+                continue;
+            }
+
+            /* Any other #directive: skip the line if not skipping */
         }
         break;
     }

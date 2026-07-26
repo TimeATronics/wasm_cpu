@@ -58,6 +58,8 @@ typedef struct {
     /* Preprocessor state */
     char *include_dirs[64];
     int include_dir_count;
+    int skip_depth;
+    bool skipping;
 } Lexer;
 
 void lexer_init(Lexer *lex, const char *filename, FILE *fp);
