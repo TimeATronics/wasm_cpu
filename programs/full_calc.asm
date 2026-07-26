@@ -13,6 +13,12 @@
     ; Read line into RAM
     call :readline
     
+    ; Check for EOF (first byte of buffer is 0 = no input read)
+    push 0
+    load
+    eqz
+    br_if :halt
+    
     ; Print newline
     push 13
     print
@@ -23,6 +29,9 @@
     call :parse_calc
     
     jump :main
+
+:halt
+    halt
 
 ; Read line into RAM starting at address 0
 :readline
@@ -35,6 +44,11 @@
     dup
     push 13
     eq
+    br_if :read_done
+    
+    ; Check for EOF (0)
+    dup
+    eqz
     br_if :read_done
     
     ; Echo character
@@ -52,8 +66,11 @@
     jump :read_loop
     
 :read_done
-    drop  ; Drop CR
-    drop  ; Drop addr
+    drop  ; Drop CR or 0
+    ; Store null terminator at current addr to clear stale data
+    push 0
+    swap
+    store
     return
 
 ; Parse RAM buffer and calculate
@@ -294,60 +311,55 @@
 
 ; Print unsigned number by extracting digits
 ; Uses return stack to reverse digit order
+; Saves rdepth to RAM[1000] to avoid corrupting call return addresses
 :print_unsigned
     dup
     eqz
     br_if :print_u_done
+    
+    ; Save current rdepth so output loop knows when to stop
+    rdepth
+    push 1000
+    store
     
 :print_u_loop
     dup
     eqz
     br_if :print_u_output
     
-    ; Divide by 10: quotient and remainder
-    dup
-    push 10
+    ; Divide n by 10 using div_s
+    dup         ; [n n]
+    push 10     ; [n n 10]
+    div_s       ; [n q]  q = n / 10
     
-    ; Do division by repeated subtraction
-    >r      ; Save dividend
-    >r      ; Save 10
-    push 0  ; quotient
-    r>      ; Get 10
-    r>      ; Get dividend
+    ; Compute remainder = n - q * 10
+    dup         ; [n q q]
+    push 10     ; [n q q 10]
+    mul         ; [n q q*10]
+    rot         ; [q q*10 n]
+    swap        ; [q n q*10]
+    sub         ; [q rem]  rem = n - q*10
     
-:divmod_loop
-    dup
-    push 10
-    lt_s
-    br_if :divmod_done
-    
-    push 10
-    sub
-    >r
-    swap
-    push 1
-    add
-    swap
-    r>
-    jump :divmod_loop
-    
-:divmod_done
-    ; Stack: quotient remainder
+    ; Convert remainder to ASCII digit and save on rstack
     push 48
-    add     ; Convert remainder to ASCII
-    >r      ; Save digit on return stack
+    add         ; [q ASCII_digit]
+    >r          ; Save digit; stack: [q]
     
-    ; Continue with quotient
     jump :print_u_loop
 
 :print_u_output
     drop
     
 :print_u_output_loop
+    ; Pop digits while rdepth > saved_rdepth
     rdepth
-    eqz
-    br_if :print_u_done
-    
+    push 1000
+    load        ; [current_rdepth saved_rdepth]
+    gt_u        ; [current > saved]
+    br_if :print_u_pop
+    return
+
+:print_u_pop
     r>
     print
     jump :print_u_output_loop

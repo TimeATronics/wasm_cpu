@@ -83,6 +83,13 @@ module stack_cpu
     localparam OP_DEPTH    = 8'h33;  // depth: push stack depth
     localparam OP_R_DEPTH  = 8'h34;  // rdepth: push return stack depth
     localparam OP_ZEQ      = 8'h35;  // eqz: pop 1, push (a == 0)
+    
+    // New instructions (Phase 0)
+    localparam OP_DIV_S    = 8'h36;  // i32.div_s: signed integer division
+    localparam OP_LOAD8_U  = 8'h37;  // load8_u: load zero-extended byte from memory
+    localparam OP_STORE8   = 8'h38;  // store8: store byte to memory
+    localparam OP_LOCAL_GET = 8'h39; // local.get: push word at [FP + idx*4]
+    localparam OP_LOCAL_SET = 8'h3A; // local.set: store word at [FP + idx*4]
 
     localparam OP_HALT     = 8'hFF;  // halt execution
 
@@ -125,6 +132,7 @@ module stack_cpu
     // Temporary register for SWAP operation
     reg [31:0] temp_swap = 0;
     reg [31:0] temp_alu = 0;
+    reg [2:0] imm_target = 0; // Number of immediate bytes to fetch (0, 1, or 4)
 
     // Main state machine
     always @(posedge clk) begin
@@ -173,12 +181,21 @@ module stack_cpu
                         OP_PUSH: begin
                             imm32 <= 0;
                             imm_byte_count <= 0;
+                            imm_target <= 3'd4;
                             state <= STATE_FETCH_IMM;
                         end
                         
                         OP_BR_IF, OP_JUMP, OP_CALL: begin
                             imm32 <= 0;
                             imm_byte_count <= 0;
+                            imm_target <= 3'd4;
+                            state <= STATE_FETCH_IMM;
+                        end
+                        
+                        OP_LOCAL_GET, OP_LOCAL_SET: begin
+                            imm32 <= 0;
+                            imm_byte_count <= 0;
+                            imm_target <= 3'd1;
                             state <= STATE_FETCH_IMM;
                         end
                         
@@ -207,28 +224,15 @@ module stack_cpu
                         flash_enable <= 0;
                         pc <= pc + 1;
                         
-                        if (opcode == OP_PUSH) begin
-                            imm32 <= imm32 | (flash_data << (imm_byte_count * 8));
-                            
-                            if (imm_byte_count == 3) begin
-                                state <= STATE_EXECUTE;
-                            end else begin
-                                imm_byte_count <= imm_byte_count + 1;
-                                state <= STATE_FETCH_IMM;
-                            end
-                        end else if (opcode == OP_BR_IF || opcode == OP_JUMP || opcode == OP_CALL) begin
-                            imm32 <= imm32 | (flash_data << (imm_byte_count * 8));
-                            
-                            if (imm_byte_count == 3) begin
-                                state <= STATE_EXECUTE;
-                            end else begin
-                                imm_byte_count <= imm_byte_count + 1;
-                                state <= STATE_FETCH_IMM;
-                            end
-                        end else begin
-                            // local.get / local.set
-                            imm32 <= {24'd0, flash_data};
+                        // Accumulate immediate byte (little-endian)
+                        imm32 <= imm32 | (flash_data << (imm_byte_count * 8));
+                        
+                        if (imm_byte_count + 1 == imm_target) begin
+                            // All immediate bytes fetched
                             state <= STATE_EXECUTE;
+                        end else begin
+                            imm_byte_count <= imm_byte_count + 1;
+                            state <= STATE_FETCH_IMM;
                         end
                     end
                 end
@@ -290,8 +294,8 @@ module stack_cpu
                             state <= STATE_ALU_WAIT;
                         end
 
-                        OP_GT_U: begin
-                            temp_alu <= (stack[sp-2] > stack[sp-1]) ? 32'd1 : 32'd0;
+                        OP_GT_S: begin
+                            temp_alu <= ($signed(stack[sp-2]) > $signed(stack[sp-1])) ? 32'd1 : 32'd0;
                             sp <= sp - 1;
                             state <= STATE_ALU_WAIT;
                         end
@@ -300,7 +304,6 @@ module stack_cpu
                             temp_alu <= (stack[sp-2] > stack[sp-1]) ? 32'd1 : 32'd0;
                             sp <= sp - 1;
                             state <= STATE_ALU_WAIT;
-                            state <= STATE_FETCH;
                         end
 
                         OP_BR_IF: begin
@@ -464,6 +467,49 @@ module stack_cpu
                             state <= STATE_HALT;
                         end
 
+                        // New instructions (Phase 0)
+                        OP_DIV_S: begin
+                            if (stack[sp-1] != 0) begin
+                                stack[sp-2] <= $signed(stack[sp-2]) / $signed(stack[sp-1]);
+                            end else begin
+                                stack[sp-2] <= 0; // Division by zero returns 0
+                            end
+                            sp <= sp - 1;
+                            state <= STATE_FETCH;
+                        end
+
+                        OP_LOAD8_U: begin
+                            ram_addr <= stack[sp-1][9:0];
+                            ram_we <= 0;
+                            state <= STATE_RAM_READ;
+                        end
+
+                        OP_STORE8: begin
+                            ram_addr <= stack[sp-1][9:0];
+                            ram_din <= {24'd0, stack[sp-2][7:0]};
+                            ram_we <= 1;
+                            sp <= sp - 2;
+                            state <= STATE_RAM_WAIT;
+                        end
+
+                        OP_LOCAL_GET: begin
+                            // imm32 contains the local index (0-255)
+                            // Access [FP + idx*4] from RAM
+                            // FP is stored at data_stack[0] conceptually; use absolute addr from imm32
+                            // For now: use imm32 as direct word address in RAM
+                            ram_addr <= imm32[9:0];
+                            ram_we <= 0;
+                            state <= STATE_RAM_READ;
+                        end
+
+                        OP_LOCAL_SET: begin
+                            ram_addr <= imm32[9:0];
+                            ram_din <= stack[sp-1];
+                            ram_we <= 1;
+                            sp <= sp - 1;
+                            state <= STATE_RAM_WAIT;
+                        end
+
                         default: begin
                             state <= STATE_FETCH;
                         end
@@ -496,6 +542,8 @@ module stack_cpu
                     ram_we <= 0;
                     if (opcode == OP_LOAD) begin
                         stack[sp-1] <= ram_dout;
+                    end else if (opcode == OP_LOAD8_U) begin
+                        stack[sp-1] <= {24'd0, ram_dout[7:0]};
                     end
                     state <= STATE_FETCH;
                 end

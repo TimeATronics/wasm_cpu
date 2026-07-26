@@ -70,6 +70,20 @@ const OPCODES = {
     'rdepth':    0x34,
     'eqz':       0x35,
     
+    // New instructions (Phase 0)
+    'div_s':     0x36,
+    'load8_u':   0x37,
+    'store8':    0x38,
+    'local.get': 0x39,
+    'local.set': 0x3A,
+    
+    // Phase 1: OS support instructions
+    'sysenter':  0x3B,
+    'eret':      0x3C,
+    'csr_read':  0x3D,
+    'csr_write': 0x3E,
+    'tlb_flush': 0x3F,
+    
     'halt':      0xFF
 };
 
@@ -115,13 +129,19 @@ function assemble(source) {
         const parts = line.split(/\s+/);
         const instruction = parts[0].toLowerCase();
         
-        if (!OPCODES.hasOwnProperty(instruction)) {
+        if (instruction === '.word') {
+            bytePos += 4; // 32-bit immediate
+            continue;
+        } else if (instruction === '.byte') {
+            bytePos += 1; // 8-bit value
+            continue;
+        } else if (!OPCODES.hasOwnProperty(instruction)) {
             throw new Error(`Unknown instruction '${instruction}' at line ${lineNum + 1}`);
         }
         
         bytePos += 1; // opcode
         
-        if (instruction === 'push' || instruction === 'br_if' || instruction === 'jump' || instruction === 'call') {
+        if (instruction === 'push' || instruction === 'br_if' || instruction === 'jump' || instruction === 'call' || instruction === 'csr_read' || instruction === 'csr_write') {
             bytePos += 4; // 32-bit immediate
         } else if (instruction === 'local.get' || instruction === 'local.set') {
             bytePos += 1; // 8-bit index
@@ -146,6 +166,33 @@ function assemble(source) {
         // Split instruction and operands
         const parts = line.split(/\s+/);
         const instruction = parts[0].toLowerCase();
+        
+        // Handle directives
+        if (instruction === '.word') {
+            if (parts.length < 2) {
+                throw new Error(`.word requires a value at line ${lineNum + 1}`);
+            }
+            // Resolve label references
+            let value = parts[1];
+            if (value.startsWith(':')) {
+                const label = value.substring(1);
+                if (labels.hasOwnProperty(label)) {
+                    value = labels[label].toString();
+                } else {
+                    throw new Error(`Undefined label '${label}' at line ${lineNum + 1}`);
+                }
+            }
+            const immBytes = parseImmediate(value);
+            bytecode.push(...immBytes);
+            continue;
+        } else if (instruction === '.byte') {
+            if (parts.length < 2) {
+                throw new Error(`.byte requires a value at line ${lineNum + 1}`);
+            }
+            const val = parts[1].startsWith('0x') ? parseInt(parts[1], 16) : parseInt(parts[1], 10);
+            bytecode.push(val & 0xFF);
+            continue;
+        }
         
         if (!OPCODES.hasOwnProperty(instruction)) {
             throw new Error(`Unknown instruction '${instruction}' at line ${lineNum + 1}`);
@@ -183,6 +230,16 @@ function assemble(source) {
             }
             
             const immBytes = parseImmediate(target);
+            bytecode.push(...immBytes);
+        } else if (instruction === 'csr_read' || instruction === 'csr_write') {
+            if (parts.length < 2) {
+                throw new Error(`${instruction.toUpperCase()} requires a CSR ID at line ${lineNum + 1}`);
+            }
+            let csrId = parts[1];
+            if (csrId.startsWith('0x')) {
+                csrId = parseInt(csrId, 16).toString();
+            }
+            const immBytes = parseImmediate(csrId);
             bytecode.push(...immBytes);
         }
     }

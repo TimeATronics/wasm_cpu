@@ -1,0 +1,1095 @@
+#include "parser.h"
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+
+/* Forward declarations for tag and typedef functions */
+typedef struct TagEntry TagEntry;
+static TagEntry *tags;
+static void register_tag(const char *name, Type *type);
+static Type *lookup_tag(const char *name);
+typedef struct TypedefEntry TypedefEntry;
+static TypedefEntry *typedefs;
+static void typedef_add(const char *name, Type *type);
+static Type *typedef_lookup(const char *name);
+
+/* Simplified type inference */
+
+/* Compute the common type of two operands (simplified usual arithmetic conversion) */
+static Type *common_type(Type *a, Type *b) {
+    if (!a) return b;
+    if (!b) return a;
+    /* Both integer types */
+    if (a->kind == TYPE_CHAR || a->kind == TYPE_INT ||
+        a->kind == TYPE_LONG || a->kind == TYPE_ENUM) {
+        if (b->kind == TYPE_CHAR || b->kind == TYPE_INT ||
+            b->kind == TYPE_LONG || b->kind == TYPE_ENUM) {
+            /* Use larger size; if equal, unsigned wins */
+            Type *result = (a->size >= b->size) ? a : b;
+            if (a->size == b->size && (a->is_unsigned || b->is_unsigned)) {
+                Type *t = type_new(result->kind, result->size);
+                t->is_unsigned = true;
+                return t;
+            }
+            return result;
+        }
+        return a; /* a is integer, b is pointer */
+    }
+    return a;
+}
+
+/* Apply type inference to a binary expression node */
+static void set_binary_type(ASTNode *node) {
+    if (node->kind == AST_BINARY && node->as.binary.left && node->as.binary.right) {
+        node->type = common_type(node->as.binary.left->type, node->as.binary.right->type);
+    } else if (node->kind == AST_ASSIGN && node->as.assign.lvalue) {
+        node->type = node->as.assign.lvalue->type;
+    } else if (node->kind == AST_TERNARY) {
+        if (node->as.if_.then_body && node->as.if_.else_body)
+            node->type = common_type(node->as.if_.then_body->type, node->as.if_.else_body->type);
+    }
+    if (node->kind == AST_INDEX) {
+        if (node->as.index.base && node->as.index.base->type &&
+            node->as.index.base->type->kind == TYPE_ARRAY)
+            node->type = node->as.index.base->type->base;
+    }
+    if (node->kind == AST_DEREF) {
+        if (node->as.unary.expr && node->as.unary.expr->type &&
+            node->as.unary.expr->type->kind == TYPE_PTR)
+            node->type = node->as.unary.expr->type->base;
+    }
+}
+
+/* chibicc-style context for loops/switch */
+static ASTNode *current_switch = NULL;
+static char *brk_label = NULL;
+static char *cont_label = NULL;
+static int label_counter = 0;
+
+static char *new_unique_name(void) {
+    char buf[32];
+    snprintf(buf, sizeof(buf), ".L..%d", label_counter++);
+    return strdup(buf);
+}
+
+static void parser_error(Parser *p, const char *msg) {
+    if (!p->has_error) {
+        snprintf(p->error_buf, sizeof(p->error_buf), "line %d col %d: %s",
+                 p->lex->line, p->lex->col, msg);
+        p->has_error = true;
+    }
+}
+
+static Token peek(Parser *p) { return lexer_peek(p->lex); }
+
+static Token consume(Parser *p) {
+    if (p->lex->has_cur) {
+        p->lex->has_cur = false;
+        return p->lex->cur;
+    }
+    return lexer_next(p->lex);
+}
+
+static Token expect(Parser *p, TokenKind kind) {
+    Token t = peek(p);
+    if (t.kind != kind) {
+        char buf[256];
+        snprintf(buf, sizeof(buf), "expected '%s', got '%s'", token_name(kind), token_name(t.kind));
+        parser_error(p, buf);
+    }
+    return consume(p);
+}
+
+static bool check(Parser *p, TokenKind kind) {
+    return peek(p).kind == kind;
+}
+
+/* Peek at the token after the current one without consuming */
+static Token peek_next(Parser *p) {
+    bool saved_has_cur = p->lex->has_cur;
+    Token saved_cur = p->lex->cur;
+    size_t saved_pos = p->lex->buf_pos;
+    int saved_line = p->lex->line;
+    int saved_col = p->lex->col;
+
+    p->lex->has_cur = false;
+    Token next = lexer_peek(p->lex);
+
+    p->lex->has_cur = saved_has_cur;
+    p->lex->cur = saved_cur;
+    p->lex->buf_pos = saved_pos;
+    p->lex->line = saved_line;
+    p->lex->col = saved_col;
+
+    return next;
+}
+
+/* Forward declarations */
+static ASTNode *parse_expr(Parser *p);
+static ASTNode *parse_expr_with_bp(Parser *p, int min_bp);
+static ASTNode *parse_stmt(Parser *p);
+static ASTNode *parse_block_item(Parser *p);
+static ASTNode *parse_decl(Parser *p, SymTable *st);
+
+/* Parse a type specifier - chibicc-style bit-counter approach */
+static Type *parse_type(Parser *p) {
+    bool is_void = false, is_char = false, is_int = false;
+    bool is_long = false, is_short = false;
+    bool is_unsigned = false, is_signed = false;
+    bool is_enum = false;
+
+    Type *base = NULL;
+
+    /* Collect type specifiers (including storage class which can interleave) */
+    bool is_double = false, is_float = false, is_struct = false, is_union = false;
+    char *struct_tag = NULL;
+    
+    while (true) {
+        TokenKind k = peek(p).kind;
+        if (k == TOK_VOID && !is_void) { consume(p); is_void = true; }
+        else if (k == TOK_CHAR && !is_char && !is_long && !is_short) { consume(p); is_char = true; }
+        else if (k == TOK_INT && !is_int) { consume(p); is_int = true; }
+        else if (k == TOK_LONG && !is_long) { consume(p); is_long = true; }
+        else if (k == TOK_SHORT && !is_short) { consume(p); is_short = true; }
+        else if (k == TOK_UNSIGNED && !is_unsigned) { consume(p); is_unsigned = true; }
+        else if (k == TOK_SIGNED && !is_signed) { consume(p); is_signed = true; }
+        else if (k == TOK_ENUM && !is_enum) { consume(p); is_enum = true; break; }
+        else if (k == TOK_DOUBLE && !is_double) { consume(p); is_double = true; break; }
+        else if (k == TOK_FLOAT && !is_float) { consume(p); is_float = true; break; }
+        else if (k == TOK_STRUCT && !is_struct && !is_union) { consume(p); is_struct = true; if (check(p, TOK_IDENT)) struct_tag = consume(p).val.str_val; break; }
+        else if (k == TOK_UNION && !is_union && !is_struct) { consume(p); is_union = true; if (check(p, TOK_IDENT)) struct_tag = consume(p).val.str_val; break; }
+        else if (k == TOK_STATIC) { consume(p); }
+        else if (k == TOK_EXTERN) { consume(p); }
+        else if (k == TOK_TYPEDEF) { consume(p); }
+        else if (k == TOK_IDENT) {
+            /* Check for typedef name */
+            Type *tdef = typedef_lookup(peek(p).val.str_val);
+            if (tdef) {
+                consume(p);
+                base = tdef;
+                break;
+            }
+            break;
+        }
+        else break;
+    }
+
+    if (is_struct || is_union) {
+        bool has_body = check(p, TOK_LBRACE);
+        if (has_body) {
+            consume(p);
+            base = is_struct ? type_struct() : type_union();
+            Member head = {0}, *cur = &head;
+            int max_align = 1;
+            while (!check(p, TOK_RBRACE)) {
+                Type *mty = parse_type(p);
+                if (check(p, TOK_IDENT)) {
+                    char *mname = consume(p).val.str_val;
+                    Member *m = member_new(mname, mty);
+                    if (is_struct) {
+                        /* Align member offset to member's alignment */
+                        int align = mty->align;
+                        if (align > max_align) max_align = align;
+                        base->size = ((base->size + align - 1) / align) * align;
+                        m->offset = base->size;
+                        base->size += type_sizeof(mty);
+                    } else {
+                        /* Union: all members at offset 0, size = max member */
+                        m->offset = 0;
+                        int sz = type_sizeof(mty);
+                        if (sz > base->size) base->size = sz;
+                        if (mty->align > max_align) max_align = mty->align;
+                    }
+                    cur->next = m;
+                    cur = m;
+                    if (check(p, TOK_SEMICOLON)) consume(p);
+                } else {
+                    parser_error(p, "expected member name");
+                    break;
+                }
+            }
+            expect(p, TOK_RBRACE);
+            /* Final alignment */
+            base->align = max_align;
+            if (is_struct)
+                base->size = ((base->size + max_align - 1) / max_align) * max_align;
+            base->members = head.next;
+            /* Register tag for later lookups */
+            if (struct_tag) register_tag(struct_tag, base);
+        } else if (struct_tag) {
+            /* Tag reference - look up previously defined type */
+            base = lookup_tag(struct_tag);
+            if (!base) {
+                base = is_struct ? type_struct() : type_union();
+                register_tag(struct_tag, base);
+            }
+        } else {
+            parser_error(p, "incomplete struct/union declaration");
+            base = type_struct();
+        }
+    } else if (is_enum) {
+        /* Parse enum specifier */
+        char *tag = NULL;
+        if (check(p, TOK_IDENT)) {
+            tag = consume(p).val.str_val;
+        }
+        if (check(p, TOK_LBRACE)) {
+            consume(p);
+            base = type_enum();
+            int val = 0;
+            while (!check(p, TOK_RBRACE)) {
+                if (!check(p, TOK_IDENT)) {
+                    parser_error(p, "expected identifier in enum");
+                    break;
+                }
+                char *name = consume(p).val.str_val;
+                if (check(p, TOK_ASSIGN)) {
+                    consume(p);
+                    val = parse_expr(p)->as.int_val;
+                }
+                Symbol *s = symtable_insert(p->globals, name, type_enum(), SYM_GLOBAL);
+                s->offset = val++;
+                if (check(p, TOK_COMMA)) consume(p);
+            }
+            expect(p, TOK_RBRACE);
+        } else if (tag) {
+            base = type_enum();
+        } else {
+            parser_error(p, "incomplete enum declaration");
+            base = type_enum();
+        }
+    } else if (is_void) {
+        base = type_new(TYPE_VOID, 0);
+    } else if (is_char) {
+        base = type_new(TYPE_CHAR, 1);
+        base->is_unsigned = is_unsigned;
+    } else if (is_short) {
+        base = type_new(TYPE_INT, 2);
+        base->is_unsigned = is_unsigned;
+    } else if (is_double) {
+        base = type_new(TYPE_DOUBLE, 8);
+    } else if (is_float) {
+        base = type_new(TYPE_DOUBLE, 4); /* treat float as smaller double */
+    } else if (is_long) {
+        base = type_new(TYPE_LONG, 4); /* 32-bit platform: long = 4 bytes */
+        base->is_unsigned = is_unsigned;
+    } else {
+        /* default: int */
+        base = type_new(TYPE_INT, 4);
+        base->is_unsigned = is_unsigned;
+    }
+
+    /* Parse pointer stars */
+    while (check(p, TOK_STAR)) {
+        consume(p);
+        base = type_ptr(base);
+    }
+    return base;
+}
+
+/* Typedef table */
+
+typedef struct TypedefEntry {
+    char *name;
+    Type *type;
+    struct TypedefEntry *next;
+} TypedefEntry;
+
+static TypedefEntry *typedefs = NULL;
+
+static void typedef_add(const char *name, Type *type) {
+    TypedefEntry *e = malloc(sizeof(TypedefEntry));
+    e->name = strdup(name);
+    e->type = type;
+    e->next = typedefs;
+    typedefs = e;
+}
+
+static Type *typedef_lookup(const char *name) {
+    for (TypedefEntry *e = typedefs; e; e = e->next)
+        if (strcmp(e->name, name) == 0)
+            return e->type;
+    return NULL;
+}
+
+/* Tag namespace (struct/union/enum tags) */
+
+typedef struct TagEntry {
+    char *name;
+    Type *type;
+    struct TagEntry *next;
+} TagEntry;
+
+static TagEntry *tags = NULL;
+
+static void register_tag(const char *name, Type *type) {
+    TagEntry *e = malloc(sizeof(TagEntry));
+    e->name = strdup(name);
+    e->type = type;
+    e->next = tags;
+    tags = e;
+}
+
+static Type *lookup_tag(const char *name) {
+    for (TagEntry *e = tags; e; e = e->next)
+        if (strcmp(e->name, name) == 0)
+            return e->type;
+    return NULL;
+}
+
+/* Parse enum identifier reference (used where enum constants act as values) */
+static int lookup_enum_val(Parser *p, const char *name) {
+    Symbol *s = symtable_lookup(p->globals, name);
+    if (s && s->type && s->type->kind == TYPE_ENUM)
+        return s->offset;
+    return -1;
+}
+
+/* Expression parsing with Pratt precedence */
+static int prefix_bp(TokenKind kind) {
+    switch (kind) {
+        case TOK_MINUS: case TOK_BANG: case TOK_TILDE:
+        case TOK_STAR: case TOK_AMP:
+        case TOK_INC: case TOK_DEC:
+            return 14; /* higher than multiplicative (13) */
+        default: return 0;
+    }
+}
+
+static int infix_bp_left(TokenKind kind) {
+    switch (kind) {
+        case TOK_COMMA: return 1;
+        case TOK_ASSIGN: case TOK_PLUS_EQ: case TOK_MINUS_EQ:
+        case TOK_STAR_EQ: case TOK_SLASH_EQ: case TOK_PERCENT_EQ:
+        case TOK_AMP_EQ: case TOK_PIPE_EQ: case TOK_CARET_EQ:
+        case TOK_SHL_EQ: case TOK_SHR_EQ:
+            return 2;
+        case TOK_QUESTION: return 3;
+        case TOK_LOR: return 4;
+        case TOK_LAND: return 5;
+        case TOK_PIPE: return 6;
+        case TOK_CARET: return 7;
+        case TOK_AMP: return 8;
+        case TOK_EQ: case TOK_NEQ: return 9;
+        case TOK_LT: case TOK_GT: case TOK_LTE: case TOK_GTE: return 10;
+        case TOK_SHL: case TOK_SHR: return 11;
+        case TOK_PLUS: case TOK_MINUS: return 12;
+        case TOK_STAR: case TOK_SLASH: case TOK_PERCENT: return 13;
+        default: return 0;
+    }
+}
+
+static ASTNode *parse_primary(Parser *p) {
+    Token t = peek(p);
+    if (t.kind == TOK_INT_LIT) {
+        consume(p);
+        return ast_int(t.val.int_val, t.line, t.col);
+    }
+    if (t.kind == TOK_CHAR_LIT) {
+        consume(p);
+        return ast_char(t.val.char_val, t.line, t.col);
+    }
+    if (t.kind == TOK_STRING_LIT) {
+        consume(p);
+        return ast_string(t.val.str_val, t.line, t.col);
+    }
+    if (t.kind == TOK_FLOAT_LIT) {
+        consume(p);
+        ASTNode *n = ast_int(0, t.line, t.col);
+        n->type = type_new(TYPE_DOUBLE, 8);
+        n->as.double_val = t.val.double_val;
+        return n;
+    }
+    if (t.kind == TOK_NULL) {
+        consume(p);
+        return ast_int(0, t.line, t.col);
+    }
+    if (t.kind == TOK_IDENT) {
+        Token name = consume(p);
+        /* Check if this is an enum constant */
+        int enum_val = lookup_enum_val(p, name.val.str_val);
+        if (enum_val >= 0) {
+            return ast_int(enum_val, t.line, t.col);
+        }
+        if (check(p, TOK_LPAREN)) {
+            consume(p);
+            ASTNode **args = NULL;
+            int arg_count = 0, arg_cap = 0;
+            if (!check(p, TOK_RPAREN)) {
+                do {
+                    if (arg_count >= arg_cap) {
+                        arg_cap = arg_cap ? arg_cap * 2 : 8;
+                        args = realloc(args, sizeof(ASTNode*) * arg_cap);
+                    }
+                    args[arg_count++] = parse_expr_with_bp(p, 2);
+                } while (check(p, TOK_COMMA) && (consume(p), 1));
+            }
+            expect(p, TOK_RPAREN);
+            ASTNode *call = ast_call(ast_ident(name.val.str_val, name.line, name.col),
+                                       args, arg_count, name.line, name.col);
+            /* Set call result type from function's return type */
+            Symbol *func_s = symtable_lookup(p->globals, name.val.str_val);
+            if (!func_s && p->locals) func_s = symtable_lookup(p->locals, name.val.str_val);
+            if (func_s && func_s->type && func_s->type->kind == TYPE_FUNC)
+                call->type = func_s->type->base;
+            return call;
+        }
+        ASTNode *id_node = ast_ident(name.val.str_val, name.line, name.col);
+        Symbol *id_s = symtable_lookup(p->globals, name.val.str_val);
+        if (!id_s && p->locals) id_s = symtable_lookup(p->locals, name.val.str_val);
+        if (id_s) id_node->type = id_s->type;
+        return id_node;
+    }
+    if (t.kind == TOK_LPAREN) {
+        consume(p);
+        /* Check for cast: (type_name)expr */
+        TokenKind nk = peek(p).kind;
+        if (nk == TOK_INT || nk == TOK_CHAR || nk == TOK_VOID ||
+            nk == TOK_LONG || nk == TOK_SHORT ||
+            nk == TOK_UNSIGNED || nk == TOK_SIGNED ||
+            nk == TOK_ENUM || nk == TOK_DOUBLE || nk == TOK_FLOAT) {
+            Type *cty = parse_type(p);
+            if (check(p, TOK_RPAREN)) {
+                consume(p);
+                ASTNode *operand = parse_expr_with_bp(p, 14);
+                ASTNode *n = ast_new(AST_CAST, t.line, t.col);
+                n->as.unary.expr = operand;
+                n->as.unary.op = TOK_INT; /* store target type as op */
+                n->type = cty;
+                return n;
+            }
+        }
+        ASTNode *e = parse_expr(p);
+        expect(p, TOK_RPAREN);
+        return e;
+    }
+    if (t.kind == TOK_SIZEOF) {
+        consume(p);
+        if (check(p, TOK_LPAREN)) {
+            consume(p); /* consume '(' */
+            /* Check if next token is a type keyword */
+            TokenKind nk = peek(p).kind;
+            if (nk == TOK_INT || nk == TOK_CHAR || nk == TOK_VOID ||
+                nk == TOK_LONG || nk == TOK_SHORT ||
+                nk == TOK_UNSIGNED || nk == TOK_SIGNED ||
+                nk == TOK_ENUM) {
+                /* sizeof(type) */
+                Type *ty = parse_type(p);
+                expect(p, TOK_RPAREN);
+                return ast_int(type_sizeof(ty), t.line, t.col);
+            }
+            /* Handle sizeof(double), sizeof(float) - also type keywords */
+            if (nk == TOK_DOUBLE || nk == TOK_FLOAT) {
+                Type *ty = parse_type(p);
+                expect(p, TOK_RPAREN);
+                ASTNode *n = ast_int(type_sizeof(ty), t.line, t.col);
+                n->type = type_new(TYPE_LONG, 4); n->type->is_unsigned = true;
+                return n;
+            }
+            /* sizeof(expr) - expression in parens */
+            ASTNode *expr = parse_expr(p);
+            expect(p, TOK_RPAREN);
+            ASTNode *n = ast_int(expr->type ? type_sizeof(expr->type) : 0, t.line, t.col);
+            n->type = type_new(TYPE_LONG, 4); n->type->is_unsigned = true;
+            return n;
+        } else {
+            /* sizeof expr - parse as unary (binding power 14) */
+            ASTNode *expr = parse_expr_with_bp(p, 14);
+            ASTNode *n = ast_int(expr->type ? type_sizeof(expr->type) : 0, t.line, t.col);
+            n->type = type_new(TYPE_LONG, 4); n->type->is_unsigned = true;
+            return n;
+        }
+    }
+    parser_error(p, "expected expression");
+    return ast_int(0, t.line, t.col);
+}
+
+static ASTNode *parse_expr_with_bp(Parser *p, int min_bp) {
+    ASTNode *left;
+
+    /* Prefix */
+    int ubp = prefix_bp(peek(p).kind);
+    if (ubp > 0) {
+        Token t = consume(p);
+        ASTNode *operand = parse_expr_with_bp(p, ubp);
+        left = ast_unary(t.kind, operand, false, t.line, t.col);
+        /* Determine unary AST kind */
+        switch (t.kind) {
+            case TOK_MINUS: left->kind = AST_UNARY; break;
+            case TOK_BANG: left->kind = AST_UNARY; break;
+            case TOK_TILDE: left->kind = AST_UNARY; break;
+            case TOK_STAR: left->kind = AST_DEREF; break;
+            case TOK_AMP: left->kind = AST_ADDR; break;
+            case TOK_INC: left->kind = AST_PREINC; break;
+            case TOK_DEC: left->kind = AST_PREDEC; break;
+            case TOK_SIZEOF: break; /* handled in primary */
+            default: break;
+        }
+        left->as.unary.op = t.kind;
+        left->as.unary.expr = operand;
+        set_binary_type(left);
+    } else {
+        left = parse_primary(p);
+    }
+
+    /* Handle postfix operations: array index and member access */
+    for (;;) {
+        if (check(p, TOK_LBRACKET)) {
+            consume(p);
+            ASTNode *idx = parse_expr(p);
+            expect(p, TOK_RBRACKET);
+            left = ast_index(left, idx, left->line, left->col);
+            set_binary_type(left);
+            continue;
+        }
+        if (peek(p).kind == TOK_DOT) {
+            consume(p);
+            Token field = consume(p);
+            if (field.kind == TOK_IDENT) {
+                ASTNode *n = ast_new(AST_MEMBER, left->line, left->col);
+                n->as.member.obj = left;
+                Type *sty = left->type;
+                if (sty && (sty->kind == TYPE_STRUCT || sty->kind == TYPE_UNION)) {
+                    for (Member *m = sty->members; m; m = m->next) {
+                        if (strcmp(m->name, field.val.str_val) == 0) {
+                            n->as.member.member = m;
+                            n->type = m->type;
+                            break;
+                        }
+                    }
+                }
+                left = n;
+            }
+            continue;
+        }
+        if (check(p, TOK_ARROW)) {
+            consume(p);
+            Token field = consume(p);
+            if (field.kind == TOK_IDENT) {
+                Type *sty = NULL;
+                if (left->type && left->type->kind == TYPE_PTR)
+                    sty = left->type->base;
+                ASTNode *n = ast_new(AST_MEMBER, left->line, left->col);
+                n->as.member.obj = left;
+                if (sty && (sty->kind == TYPE_STRUCT || sty->kind == TYPE_UNION)) {
+                    for (Member *m = sty->members; m; m = m->next) {
+                        if (strcmp(m->name, field.val.str_val) == 0) {
+                            n->as.member.member = m;
+                            n->type = m->type;
+                            break;
+                        }
+                    }
+                }
+                left = n;
+            }
+            continue;
+        }
+        /* Postfix inc/dec */
+        if (check(p, TOK_INC)) {
+            consume(p);
+            left = ast_unary(TOK_INC, left, true, left->line, left->col);
+            left->kind = AST_POSTINC;
+            continue;
+        }
+        if (check(p, TOK_DEC)) {
+            consume(p);
+            left = ast_unary(TOK_DEC, left, true, left->line, left->col);
+            left->kind = AST_POSTDEC;
+            continue;
+        }
+        break;
+    }
+
+    /* Infix */
+    for (;;) {
+        TokenKind k = peek(p).kind;
+        int bp = infix_bp_left(k);
+        if (bp == 0 || bp < min_bp) break;
+
+        if (k == TOK_QUESTION) {
+            consume(p);
+            ASTNode *cond = left;
+            ASTNode *middle = parse_expr(p);
+            expect(p, TOK_COLON);
+            ASTNode *right = parse_expr_with_bp(p, 2);
+            left = ast_new(AST_TERNARY, cond->line, cond->col);
+            left->as.if_.cond = cond;
+            left->as.if_.then_body = middle;
+            left->as.if_.else_body = right;
+            set_binary_type(left);
+            continue;
+        }
+
+        if (k == TOK_ASSIGN || k == TOK_PLUS_EQ || k == TOK_MINUS_EQ ||
+            k == TOK_STAR_EQ || k == TOK_SLASH_EQ || k == TOK_PERCENT_EQ ||
+            k == TOK_AMP_EQ || k == TOK_PIPE_EQ || k == TOK_CARET_EQ ||
+            k == TOK_SHL_EQ || k == TOK_SHR_EQ) {
+            Token t = consume(p);
+            ASTNode *right = parse_expr_with_bp(p, 2);
+            left = ast_assign(left, t.kind, right, t.line, t.col);
+            set_binary_type(left);
+            continue;
+        }
+
+        Token t = consume(p);
+        ASTNode *right = parse_expr_with_bp(p, bp + 1);
+        left = ast_binary(t.kind, left, right, t.line, t.col);
+        set_binary_type(left);
+    }
+
+    return left;
+}
+
+static ASTNode *parse_expr(Parser *p) {
+    return parse_expr_with_bp(p, 0);
+}
+
+static ASTNode *parse_block(Parser *p) {
+    int sl = peek(p).line, sc = peek(p).col;
+    expect(p, TOK_LBRACE);
+    ASTNode **stmts = NULL;
+    int count = 0, cap = 0;
+    while (!check(p, TOK_RBRACE) && !check(p, TOK_EOF)) {
+        if (count >= cap) {
+            cap = cap ? cap * 2 : 16;
+            stmts = realloc(stmts, sizeof(ASTNode*) * cap);
+        }
+        stmts[count++] = parse_block_item(p);
+    }
+    expect(p, TOK_RBRACE);
+    return ast_block(stmts, count, sl, sc);
+}
+
+/* Block item = statement or declaration */
+static ASTNode *parse_block_item(Parser *p) {
+    Token t = peek(p);
+    if (t.kind == TOK_INT || t.kind == TOK_CHAR || t.kind == TOK_VOID ||
+        t.kind == TOK_LONG || t.kind == TOK_SHORT ||
+        t.kind == TOK_UNSIGNED || t.kind == TOK_SIGNED ||
+        t.kind == TOK_ENUM || t.kind == TOK_DOUBLE || t.kind == TOK_FLOAT ||
+        t.kind == TOK_STRUCT || t.kind == TOK_UNION ||
+        t.kind == TOK_STATIC || t.kind == TOK_EXTERN || t.kind == TOK_TYPEDEF ||
+        (t.kind == TOK_IDENT && typedef_lookup(t.val.str_val) != NULL)) {
+        return parse_decl(p, p->locals ? p->locals : p->globals);
+    }
+    return parse_stmt(p);
+}
+
+/* Statement - does NOT accept declarations as statement bodies */
+static ASTNode *parse_stmt(Parser *p) {
+    Token t = peek(p);
+
+    if (t.kind == TOK_SEMICOLON) {
+        consume(p);
+        return ast_new(AST_NULL_STMT, t.line, t.col);
+    }
+
+    if (t.kind == TOK_LBRACE) return parse_block(p);
+
+    if (t.kind == TOK_RETURN) {
+        consume(p);
+        ASTNode *expr = NULL;
+        if (!check(p, TOK_SEMICOLON)) expr = parse_expr(p);
+        expect(p, TOK_SEMICOLON);
+        return ast_return(expr, t.line, t.col);
+    }
+
+    if (t.kind == TOK_IF) {
+        consume(p);
+        expect(p, TOK_LPAREN);
+        ASTNode *cond = parse_expr(p);
+        expect(p, TOK_RPAREN);
+        ASTNode *then = parse_stmt(p);
+        ASTNode *else_ = NULL;
+        if (check(p, TOK_ELSE)) {
+            consume(p);
+            else_ = parse_stmt(p);
+        }
+        return ast_if(cond, then, else_, t.line, t.col);
+    }
+
+    if (t.kind == TOK_WHILE) {
+        consume(p);
+        expect(p, TOK_LPAREN);
+        ASTNode *cond = parse_expr(p);
+        expect(p, TOK_RPAREN);
+        ASTNode *n = ast_new(AST_WHILE, t.line, t.col);
+        n->as.while_.cond = cond;
+        n->as.while_.brk_label = new_unique_name();
+        n->as.while_.cont_label = new_unique_name();
+
+        char *prev_brk = brk_label;
+        char *prev_cont = cont_label;
+        brk_label = n->as.while_.brk_label;
+        cont_label = n->as.while_.cont_label;
+        n->as.while_.body = parse_stmt(p);
+        brk_label = prev_brk;
+        cont_label = prev_cont;
+        return n;
+    }
+
+    if (t.kind == TOK_FOR) {
+        consume(p);
+        expect(p, TOK_LPAREN);
+        ASTNode *n = ast_new(AST_FOR, t.line, t.col);
+        n->as.for_.brk_label = new_unique_name();
+        n->as.for_.cont_label = new_unique_name();
+
+        char *prev_brk = brk_label;
+        char *prev_cont = cont_label;
+        brk_label = n->as.for_.brk_label;
+        cont_label = n->as.for_.cont_label;
+
+        /* Init: can be empty, declaration, or expression */
+        ASTNode *init = NULL;
+        if (!check(p, TOK_SEMICOLON)) {
+            Token ft = peek(p);
+            if (ft.kind == TOK_INT || ft.kind == TOK_CHAR || ft.kind == TOK_VOID ||
+                ft.kind == TOK_LONG || ft.kind == TOK_SHORT ||
+                ft.kind == TOK_UNSIGNED || ft.kind == TOK_SIGNED ||
+                ft.kind == TOK_ENUM || ft.kind == TOK_DOUBLE || ft.kind == TOK_FLOAT ||
+                ft.kind == TOK_STRUCT || ft.kind == TOK_UNION ||
+                ft.kind == TOK_STATIC || ft.kind == TOK_EXTERN || ft.kind == TOK_TYPEDEF ||
+                (ft.kind == TOK_IDENT && typedef_lookup(ft.val.str_val) != NULL)) {
+                init = parse_decl(p, p->locals ? p->locals : p->globals);
+            } else {
+                init = parse_expr(p);
+                expect(p, TOK_SEMICOLON);
+            }
+        } else {
+            expect(p, TOK_SEMICOLON);
+        }
+        ASTNode *cond = check(p, TOK_SEMICOLON) ? NULL : parse_expr(p);
+        expect(p, TOK_SEMICOLON);
+        ASTNode *inc = check(p, TOK_RPAREN) ? NULL : parse_expr(p);
+        expect(p, TOK_RPAREN);
+        n->as.for_.init = init;
+        n->as.for_.cond = cond;
+        n->as.for_.inc = inc;
+        n->as.for_.body = parse_stmt(p);
+
+        brk_label = prev_brk;
+        cont_label = prev_cont;
+        return n;
+    }
+
+    if (t.kind == TOK_DO) {
+        consume(p);
+        ASTNode *n = ast_new(AST_DO_WHILE, t.line, t.col);
+        n->as.do_while.brk_label = new_unique_name();
+        n->as.do_while.cont_label = new_unique_name();
+        n->as.do_while.loop_top_label = new_unique_name();
+
+        char *prev_brk = brk_label;
+        char *prev_cont = cont_label;
+        brk_label = n->as.do_while.brk_label;
+        cont_label = n->as.do_while.cont_label;
+
+        n->as.do_while.body = parse_stmt(p);
+        expect(p, TOK_WHILE);
+        expect(p, TOK_LPAREN);
+        n->as.do_while.cond = parse_expr(p);
+        expect(p, TOK_RPAREN);
+        expect(p, TOK_SEMICOLON);
+
+        brk_label = prev_brk;
+        cont_label = prev_cont;
+        return n;
+    }
+
+    if (t.kind == TOK_BREAK) {
+        consume(p);
+        expect(p, TOK_SEMICOLON);
+        ASTNode *n = ast_new(AST_BREAK, t.line, t.col);
+        n->as.jump_label.label = brk_label ? strdup(brk_label) : NULL;
+        return n;
+    }
+
+    if (t.kind == TOK_CONTINUE) {
+        consume(p);
+        expect(p, TOK_SEMICOLON);
+        ASTNode *n = ast_new(AST_CONTINUE, t.line, t.col);
+        n->as.jump_label.label = cont_label ? strdup(cont_label) : NULL;
+        return n;
+    }
+
+    if (t.kind == TOK_GOTO) {
+        consume(p);
+        Token label = expect(p, TOK_IDENT);
+        expect(p, TOK_SEMICOLON);
+        ASTNode *n = ast_new(AST_GOTO, t.line, t.col);
+        n->as.goto_.target = strdup(label.val.str_val);
+        return n;
+    }
+
+    if (t.kind == TOK_SWITCH) {
+        consume(p);
+        expect(p, TOK_LPAREN);
+        ASTNode *expr = parse_expr(p);
+        expect(p, TOK_RPAREN);
+        ASTNode *n = ast_new(AST_SWITCH, t.line, t.col);
+        n->as.switch_.expr = expr;
+        n->as.switch_.case_next = NULL;
+        n->as.switch_.default_case = NULL;
+        n->as.switch_.brk_label = new_unique_name();
+
+        /* Save and set context for nested case/default parsing */
+        ASTNode *prev_switch = current_switch;
+        char *prev_brk = brk_label;
+        current_switch = n;
+        brk_label = n->as.switch_.brk_label;
+
+        n->as.switch_.body = parse_stmt(p);
+
+        current_switch = prev_switch;
+        brk_label = prev_brk;
+        return n;
+    }
+
+    if (t.kind == TOK_CASE) {
+        if (!current_switch)
+            parser_error(p, "stray case");
+        consume(p);
+        ASTNode *val = parse_expr(p);
+        /* Support GNU case ranges: case start ... end: */
+        long begin = 0, end = 0;
+        if (val && val->kind == AST_INT_LIT)
+            begin = val->as.int_val;
+        if (check(p, TOK_ELLIPSIS)) {
+            consume(p);
+            ASTNode *end_val = parse_expr(p);
+            if (end_val && end_val->kind == AST_INT_LIT)
+                end = end_val->as.int_val;
+        } else {
+            end = begin;
+        }
+        expect(p, TOK_COLON);
+        ASTNode *body = parse_stmt(p);
+        ASTNode *n = ast_new(AST_CASE, t.line, t.col);
+        n->as.case_.val = val;
+        n->as.case_.body = body;
+        n->as.case_.label = new_unique_name();
+        n->as.case_.begin = begin;
+        n->as.case_.end = end;
+        /* Link into current switch's case list */
+        n->as.case_.case_next = current_switch->as.switch_.case_next;
+        current_switch->as.switch_.case_next = n;
+        return n;
+    }
+
+    if (t.kind == TOK_DEFAULT) {
+        if (!current_switch)
+            parser_error(p, "stray default");
+        consume(p);
+        expect(p, TOK_COLON);
+        ASTNode *body = parse_stmt(p);
+        ASTNode *n = ast_new(AST_CASE, t.line, t.col);
+        n->as.case_.val = NULL;
+        n->as.case_.body = body;
+        n->as.case_.label = new_unique_name();
+        n->as.case_.begin = 0;
+        n->as.case_.end = 0;
+        current_switch->as.switch_.default_case = n;
+        return n;
+    }
+
+    /* Label: identifier followed by colon */
+    if (t.kind == TOK_IDENT) {
+        Token next = peek_next(p);
+        if (next.kind == TOK_COLON) {
+            consume(p); /* consume identifier */
+            consume(p); /* consume colon */
+            ASTNode *body = parse_stmt(p);
+            ASTNode *n = ast_new(AST_LABEL, t.line, t.col);
+            n->as.label.name = strdup(t.val.str_val);
+            n->as.label.stmt = body;
+            return n;
+        }
+    }
+
+    /* Expression statement */
+    ASTNode *expr = parse_expr(p);
+    expect(p, TOK_SEMICOLON);
+    ASTNode *stmt = ast_new(AST_EXPR_STMT, t.line, t.col);
+    /* We'll just return expr and handle in codegen */
+    return expr;
+}
+
+static ASTNode *parse_decl(Parser *p, SymTable *st) {
+    int sl = peek(p).line, sc = peek(p).col;
+
+    /* Consume storage class specifiers */
+    bool is_static = false, is_extern = false, is_typedef = false;
+    while (true) {
+        TokenKind k = peek(p).kind;
+        if (k == TOK_STATIC && !is_static) { consume(p); is_static = true; }
+        else if (k == TOK_EXTERN && !is_extern) { consume(p); is_extern = true; }
+        else if (k == TOK_TYPEDEF && !is_typedef) { consume(p); is_typedef = true; }
+        else break;
+    }
+    Type *ty = parse_type(p);
+
+    /* Parse the name (identifier for both functions and variables) */
+    char *vname = NULL;
+    if (check(p, TOK_IDENT) && peek(p).val.str_val) {
+        vname = consume(p).val.str_val;
+    }
+
+    /* Array declarator: name followed by [size] */
+    if (vname && check(p, TOK_LBRACKET)) {
+        consume(p);
+        int arr_size = 0;
+        if (check(p, TOK_INT_LIT)) {
+            arr_size = consume(p).val.int_val;
+        }
+        expect(p, TOK_RBRACKET);
+        ty = type_array(ty, arr_size);
+    }
+
+    /* Typedef: add to typedef table and skip */
+    if (is_typedef && vname) {
+        typedef_add(vname, ty);
+        expect(p, TOK_SEMICOLON);
+        return ast_new(AST_NULL_STMT, sl, sc);
+    }
+
+    /* Function declaration - check for '(' after name */
+    if (vname && check(p, TOK_LPAREN)) {
+        consume(p);
+        /* Parse params */
+        ASTNode **params = NULL;
+        int param_count = 0, param_cap = 0;
+        Type **param_types = NULL;
+        int type_cap = 0;
+
+        if (!check(p, TOK_RPAREN)) {
+            do {
+                Type *pty = parse_type(p);
+                char *pname = NULL;
+                if (check(p, TOK_IDENT)) {
+                    pname = consume(p).val.str_val;
+                }
+                /* (void) means no parameters in C */
+                if (pty->kind == TYPE_VOID && !pname && check(p, TOK_RPAREN)) {
+                    break;
+                }
+                if (param_count >= param_cap) {
+                    param_cap = param_cap ? param_cap * 2 : 8;
+                    params = realloc(params, sizeof(ASTNode*) * param_cap);
+                    param_types = realloc(param_types, sizeof(Type*) * param_cap);
+                }
+                params[param_count] = pname ? ast_var_decl(pname, pty, NULL, 0, 0) : NULL;
+                param_types[param_count] = pty;
+                param_count++;
+            } while (check(p, TOK_COMMA) && (consume(p), 1));
+        }
+        expect(p, TOK_RPAREN);
+        Type *fty = type_func(ty, param_types, param_count, false);
+        fty->param_count = param_count;
+
+        /* Prototype */
+        if (check(p, TOK_SEMICOLON)) {
+            consume(p);
+            Symbol *s = symtable_insert(p->globals, vname, fty, SYM_FUNC);
+            s->is_defined = false;
+            return ast_func_decl(vname, fty->base, params, param_count, NULL, sl, sc);
+        }
+
+        /* Full definition - only allowed at top level */
+        if (st != p->globals) {
+            parser_error(p, "nested function definitions not allowed");
+            return ast_func_decl(vname, fty->base, params, param_count, NULL, sl, sc);
+        }
+        p->locals = symtable_new(p->globals);
+        for (int i = 0; i < param_count; i++) {
+            if (params[i]) {
+                symtable_insert(p->locals, params[i]->as.var_decl.name,
+                                params[i]->as.var_decl.type, SYM_PARAM);
+            }
+        }
+        ASTNode *body = parse_block(p);
+        int frame_size = p->locals->frame_size;
+        symtable_free(p->locals);
+        p->locals = NULL;
+
+        Symbol *s = symtable_insert(p->globals, vname, fty, SYM_FUNC);
+        s->is_defined = true;
+        s->offset = frame_size;
+
+        return ast_func_decl(vname, fty->base, params, param_count, body, sl, sc);
+    }
+
+    /* Variable declaration */
+    if (vname) {
+        if (is_extern) {
+            /* Extern: declare but don't allocate */
+            if (st == p->locals)
+                symtable_insert(p->locals, vname, ty, SYM_GLOBAL);
+            else
+                symtable_insert(p->globals, vname, ty, SYM_GLOBAL);
+        } else if (st == p->locals) {
+            symtable_insert(p->locals, vname, ty, is_static ? SYM_GLOBAL : SYM_LOCAL);
+        } else {
+            symtable_insert(p->globals, vname, ty, SYM_GLOBAL);
+        }
+    }
+
+    ASTNode *init = NULL;
+    if (check(p, TOK_ASSIGN)) {
+        consume(p);
+        if (check(p, TOK_LBRACE)) {
+            /* Initializer list: { expr1, expr2, ... } */
+            consume(p);
+            ASTNode **inits = NULL;
+            int init_count = 0, init_cap = 0;
+            while (!check(p, TOK_RBRACE)) {
+                if (init_count >= init_cap) {
+                    init_cap = init_cap ? init_cap * 2 : 16;
+                    inits = realloc(inits, sizeof(ASTNode*) * init_cap);
+                }
+                inits[init_count++] = parse_expr_with_bp(p, 2);
+                if (check(p, TOK_COMMA)) consume(p);
+            }
+            expect(p, TOK_RBRACE);
+            /* Create a block node to hold the initializers */
+            init = ast_block(inits, init_count, sl, sc);
+            /* If array size is 0 (incomplete), set from initializer count */
+            if (ty && ty->kind == TYPE_ARRAY && ty->size == 0)
+                ty->size = init_count;
+        } else {
+            init = parse_expr(p);
+            /* Handle string literal initializer for incomplete array */
+            if (ty && ty->kind == TYPE_ARRAY && ty->size == 0 &&
+                init && init->kind == AST_STRING_LIT) {
+                int slen = strlen(init->as.str_val);
+                ty->size = slen + 1;
+            }
+        }
+    }
+    expect(p, TOK_SEMICOLON);
+
+    if (!vname) return ast_new(AST_NULL_STMT, sl, sc);
+    return ast_var_decl(vname, ty, init, sl, sc);
+}
+
+void parser_init(Parser *p, Lexer *lex) {
+    memset(p, 0, sizeof(*p));
+    p->lex = lex;
+    p->globals = symtable_new(NULL);
+}
+
+ASTNode *parser_parse(Parser *p) {
+    ASTNode **decls = NULL;
+    int count = 0, cap = 0;
+    while (!check(p, TOK_EOF) && !p->has_error) {
+        ASTNode *d = parse_decl(p, p->globals);
+        if (d) {
+            if (count >= cap) {
+                cap = cap ? cap * 2 : 16;
+                decls = realloc(decls, sizeof(ASTNode*) * cap);
+            }
+            decls[count++] = d;
+        }
+    }
+    return ast_block(decls, count, 1, 1);
+}
