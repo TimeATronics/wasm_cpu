@@ -14,6 +14,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <stdbool.h>
+#include "shared/elf32.h"
 
 #ifdef _WIN32
 #include <io.h>
@@ -74,7 +75,7 @@ static const char *opcode_names[256] = {
     [0x40] = "get_fp",
     [0x41] = "fadd",     [0x42] = "fsub",     [0x43] = "fmul",
     [0x44] = "fdiv",     [0x45] = "fcmp",     [0x46] = "f2i",
-    [0x47] = "i2f",
+    [0x47] = "i2f",      [0x48] = "call_ind",
     [0xFF] = "halt",
 };
 
@@ -304,7 +305,7 @@ static int execute(cpu_t *cpu, const uint8_t *program, size_t prog_len) {
         [0x40] = &&do_get_fp,
         [0x41] = &&do_fadd,    [0x42] = &&do_fsub,    [0x43] = &&do_fmul,
         [0x44] = &&do_fdiv,    [0x45] = &&do_fcmp,    [0x46] = &&do_f2i,
-        [0x47] = &&do_i2f,
+        [0x47] = &&do_i2f,   [0x48] = &&do_call_ind,
         [0xFF] = &&do_halt,
     };
 
@@ -600,6 +601,16 @@ static int execute(cpu_t *cpu, const uint8_t *program, size_t prog_len) {
     }
     do_f2i:  { double v = POP_DOUBLE(); push(cpu, (uint32_t)(int32_t)v); goto fetch_next; }
     do_i2f:  { uint32_t v = pop(cpu); PUSH_DOUBLE((double)(int32_t)v); goto fetch_next; }
+    do_call_ind: {
+        uint32_t target = pop(cpu);       /* target address from stack */
+        uint32_t frame_size = rpop(cpu);  /* frame_size from return stack */
+        uint32_t old_fp = cpu->fp;
+        rpush(cpu, cpu->pc);
+        rpush(cpu, old_fp);
+        cpu->fp = cpu->fp + frame_size;
+        cpu->pc = target;
+        goto fetch_next;
+    }
 
     do_halt:
         cpu->halted = true;
@@ -681,6 +692,32 @@ int main(int argc, char **argv) {
         }
     }
     fclose(f);
+
+    /* Detect and extract ELF executable .text segment */
+    if (file_size >= (long)sizeof(Elf32_Ehdr) &&
+        program[EI_MAG0] == ELFMAG0 && program[EI_MAG1] == ELFMAG1 &&
+        program[EI_MAG2] == ELFMAG2 && program[EI_MAG3] == ELFMAG3) {
+        Elf32_Ehdr *ehdr = (Elf32_Ehdr *)program;
+        if (ehdr->e_type == ET_EXEC && ehdr->e_phoff > 0 && ehdr->e_phnum > 0) {
+            /* Find PT_LOAD segment */
+            Elf32_Phdr *phdr = (Elf32_Phdr *)(program + ehdr->e_phoff);
+            uint32_t text_off = 0, text_size = 0;
+            for (int i = 0; i < ehdr->e_phnum; i++) {
+                if (phdr[i].p_type == 1 /* PT_LOAD */) {
+                    text_off = phdr[i].p_offset;
+                    text_size = phdr[i].p_filesz;
+                    break;
+                }
+            }
+            if (text_size > 0 && text_off + text_size <= (uint32_t)file_size) {
+                uint8_t *text = malloc(text_size);
+                memcpy(text, program + text_off, text_size);
+                free(program);
+                program = text;
+                file_size = (long)text_size;
+            }
+        }
+    }
 
     fprintf(stderr, "Loaded %ld bytes from %s\n", file_size, filename);
 

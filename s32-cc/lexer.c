@@ -200,11 +200,18 @@ Token lexer_next(Lexer *lex) {
             }
             
             /* Integer literal with possible suffix */
-            unsigned long val = strtoul(buf, NULL, 10);
+            bool is_long = false;
             if (peek_ch(lex) == 'u' || peek_ch(lex) == 'U') next_ch(lex);
-            if (peek_ch(lex) == 'l' || peek_ch(lex) == 'L') next_ch(lex);
+            if (peek_ch(lex) == 'l' || peek_ch(lex) == 'L') { next_ch(lex); is_long = true; }
+            if (!is_long && (peek_ch(lex) == 'l' || peek_ch(lex) == 'L')) { next_ch(lex); is_long = true; }
             Token t = make_token(TOK_INT_LIT, sl, sc);
-            t.val.int_val = (int)val;
+            if (is_long) {
+                t.is_long_lit = true;
+                t.val.long_val = strtoll(buf, NULL, 10);
+            } else {
+                t.is_long_lit = false;
+                t.val.int_val = (int)strtoul(buf, NULL, 10);
+            }
             return t;
         }
         
@@ -269,6 +276,7 @@ Token lexer_next(Lexer *lex) {
         else if (len == 6 && memcmp(id, "static", 6) == 0) kind = TOK_STATIC;
         else if (len == 6 && memcmp(id, "extern", 6) == 0) kind = TOK_EXTERN;
         else if (len == 5 && memcmp(id, "const", 5) == 0) kind = TOK_CONST;
+        else if (len == 8 && memcmp(id, "volatile", 8) == 0) kind = TOK_VOLATILE;
         else if (len == 6 && memcmp(id, "double", 6) == 0) kind = TOK_DOUBLE;
         else if (len == 5 && memcmp(id, "float", 5) == 0) kind = TOK_FLOAT;
         if (kind != TOK_IDENT) { free(id); }

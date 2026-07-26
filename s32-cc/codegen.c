@@ -86,6 +86,11 @@ static void add_fixup(Codegen *cg, int code_pos, const char *label) {
 }
 
 static int add_string(Codegen *cg, const char *str, int len) {
+    /* Check for duplicates */
+    for (int i = 0; i < cg->string_count; i++) {
+        if (cg->strings[i].len == len && memcmp(cg->strings[i].str, str, len) == 0)
+            return i;
+    }
     if (cg->string_count >= cg->string_cap) {
         cg->string_cap *= 2;
         cg->strings = realloc(cg->strings, sizeof(*cg->strings) * cg->string_cap);
@@ -98,7 +103,7 @@ static int add_string(Codegen *cg, const char *str, int len) {
     cg->strings[cg->string_count].len = len;
     cg->data_end += len + 1; /* +1 for null terminator */
     cg->string_count++;
-    return addr;
+    return cg->string_count - 1;
 }
 
 /* Patch a GOTO/BR_IF target at code_pos */
@@ -109,16 +114,27 @@ static void patch_jump(Codegen *cg, int code_pos, int target) {
     cg->code[code_pos + 4] = (target >> 24) & 0xFF;
 }
 
-/* Resolve all forward-referenced fixups */
+/* Resolve all forward-referenced fixups, mark resolved ones with NULL label */
 static void resolve_fixups(Codegen *cg) {
     for (int i = 0; i < cg->fixup_count; i++) {
+        if (cg->fixups[i].label == NULL) continue;
         int addr = find_label(cg, cg->fixups[i].label);
         if (addr < 0) {
-            fprintf(stderr, "s32-cc: undefined label '%s'\n", cg->fixups[i].label);
+            fprintf(stderr, "s32-cc: undefined reference to '%s'\n", cg->fixups[i].label);
             continue;
         }
         patch_jump(cg, cg->fixups[i].code_pos, addr);
+        free(cg->fixups[i].label);
+        cg->fixups[i].label = NULL;
     }
+}
+
+/* Generate unique label names for short-circuit branch targets */
+static int sc_label_counter = 0;
+static char *sc_label(void) {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "sc.%d", sc_label_counter++);
+    return strdup(buf);
 }
 
 /* Constant folding helpers */
@@ -187,7 +203,12 @@ static void codegen_expr(Codegen *cg, ASTNode *node, SymTable *st) {
     switch (node->kind) {
 
     case AST_INT_LIT:
-        if (node->type && node->type->kind == TYPE_DOUBLE) {
+        if (node->type && node->type->kind == TYPE_LONG) {
+            /* Push 64-bit long as 2 words: hi then lo */
+            uint64_t bits = (uint64_t)node->as.long_val;
+            emit_push(cg, (uint32_t)(bits >> 32));   /* hi */
+            emit_push(cg, (uint32_t)(bits & 0xFFFFFFFF)); /* lo */
+        } else if (node->type && node->type->kind == TYPE_DOUBLE) {
             /* Push double as 2 words: hi then lo */
             uint64_t bits;
             memcpy(&bits, &node->as.double_val, 8);
@@ -203,8 +224,10 @@ static void codegen_expr(Codegen *cg, ASTNode *node, SymTable *st) {
         break;
 
     case AST_STRING_LIT: {
-        int addr = add_string(cg, node->as.str_val, strlen(node->as.str_val));
-        emit_push(cg, (uint32_t)(cg->code_len + addr)); /* absolute byte addr */
+        /* Find pre-allocated RAM offset for this string */
+        int idx = add_string(cg, node->as.str_val, strlen(node->as.str_val));
+        int str_offset = cg->strings[idx].addr;
+        emit_push(cg, (uint32_t)str_offset);
         break;
     }
 
@@ -217,8 +240,10 @@ static void codegen_expr(Codegen *cg, ASTNode *node, SymTable *st) {
             break;
         }
         if (s->kind == SYM_FUNC) {
-            /* Function pointer - push address (placeholder) */
-            emit_push(cg, 0);
+            /* Function pointer - push address via fixup */
+            int pos = cg->code_len;
+            emit_push(cg, 0); /* placeholder */
+            add_fixup(cg, pos, node->as.ident);
             break;
         }
         /* Array, struct, and union variables decay to pointer (address) */
@@ -233,13 +258,37 @@ static void codegen_expr(Codegen *cg, ASTNode *node, SymTable *st) {
             }
             break;
         }
-        /* Double variables span 2 words: push hi then lo */
-        if (s->type && s->type->kind == TYPE_DOUBLE) {
-            emit_local_get(cg, sym_addr(s) + 1); /* hi */
-            emit_local_get(cg, sym_addr(s));     /* lo */
+        /* Long variables span 2 words: push hi then lo */
+        if (s->type && s->type->kind == TYPE_LONG) {
+            if (s->kind == SYM_GLOBAL) {
+                int addr = sym_addr(s);
+                emit_push(cg, (uint32_t)(addr + 1)); emit_op(cg, OP_LOAD); /* hi */
+                emit_push(cg, (uint32_t)addr); emit_op(cg, OP_LOAD);        /* lo */
+            } else {
+                emit_local_get(cg, sym_addr(s) + 1); /* hi */
+                emit_local_get(cg, sym_addr(s));     /* lo */
+            }
             break;
         }
-        emit_local_get(cg, sym_addr(s));
+        /* Double variables span 2 words: push hi then lo */
+        if (s->type && s->type->kind == TYPE_DOUBLE) {
+            if (s->kind == SYM_GLOBAL) {
+                int addr = sym_addr(s);
+                emit_push(cg, (uint32_t)(addr + 1)); emit_op(cg, OP_LOAD); /* hi */
+                emit_push(cg, (uint32_t)addr); emit_op(cg, OP_LOAD);        /* lo */
+            } else {
+                emit_local_get(cg, sym_addr(s) + 1); /* hi */
+                emit_local_get(cg, sym_addr(s));     /* lo */
+            }
+            break;
+        }
+        /* Scalar value: use absolute addressing for globals/statics */
+        if (s->kind == SYM_GLOBAL) {
+            emit_push(cg, (uint32_t)sym_addr(s));
+            emit_op(cg, OP_LOAD);
+        } else {
+            emit_local_get(cg, sym_addr(s));
+        }
         break;
     }
 
@@ -250,21 +299,28 @@ static void codegen_expr(Codegen *cg, ASTNode *node, SymTable *st) {
         /* Short-circuit logical AND */
         if (op == TOK_LAND) {
             codegen_expr(cg, node->as.binary.left, st);
-            emit_op(cg, OP_DUP);
-            int patch_br = cg->code_len;
+            emit_op(cg, OP_EQZ);
+            emit_op(cg, OP_EQZ);
+            char *lbl_right = sc_label();
+            int br_pos = cg->code_len;
             emit_op(cg, OP_BR_IF);
+            add_fixup(cg, br_pos, lbl_right);
             emit_u32(cg, 0);
-            emit_op(cg, OP_DROP);
+            /* left was falsy: result is 0 */
             emit_push(cg, 0);
-            int patch_jmp = cg->code_len;
+            char *lbl_end = sc_label();
+            int jmp_pos = cg->code_len;
             emit_op(cg, OP_JUMP);
+            add_fixup(cg, jmp_pos, lbl_end);
             emit_u32(cg, 0);
-            patch_jump(cg, patch_br, cg->code_len);
-            emit_op(cg, OP_DROP);
+            /* right side: label for BR_IF target */
+            add_label(cg, lbl_right);
             codegen_expr(cg, node->as.binary.right, st);
             emit_op(cg, OP_EQZ);
             emit_op(cg, OP_EQZ);
-            patch_jump(cg, patch_jmp, cg->code_len);
+            add_label(cg, lbl_end);
+            free(lbl_right);
+            free(lbl_end);
             break;
         }
 
@@ -272,20 +328,28 @@ static void codegen_expr(Codegen *cg, ASTNode *node, SymTable *st) {
         if (op == TOK_LOR) {
             codegen_expr(cg, node->as.binary.left, st);
             emit_op(cg, OP_DUP);
-            int patch_br = cg->code_len;
+            char *lbl_true = sc_label();
+            int br_pos = cg->code_len;
             emit_op(cg, OP_BR_IF);
+            add_fixup(cg, br_pos, lbl_true);
             emit_u32(cg, 0);
+            /* left was falsy: eval right */
             emit_op(cg, OP_DROP);
             codegen_expr(cg, node->as.binary.right, st);
             emit_op(cg, OP_EQZ);
             emit_op(cg, OP_EQZ);
-            int patch_jmp = cg->code_len;
+            char *lbl_end = sc_label();
+            int jmp_pos = cg->code_len;
             emit_op(cg, OP_JUMP);
+            add_fixup(cg, jmp_pos, lbl_end);
             emit_u32(cg, 0);
-            patch_jump(cg, patch_br, cg->code_len);
+            /* true branch: result is 1 */
+            add_label(cg, lbl_true);
             emit_op(cg, OP_DROP);
             emit_push(cg, 1);
-            patch_jump(cg, patch_jmp, cg->code_len);
+            add_label(cg, lbl_end);
+            free(lbl_true);
+            free(lbl_end);
             break;
         }
 
@@ -336,8 +400,102 @@ static void codegen_expr(Codegen *cg, ASTNode *node, SymTable *st) {
 
         /* Regular binary: eval left, eval right, op */
         codegen_expr(cg, node->as.binary.left, st);
+        /* Promote left to long if needed */
+        if (node->type && node->type->kind == TYPE_LONG) {
+            if (node->as.binary.left->type && node->as.binary.left->type->kind != TYPE_LONG) {
+                emit_push(cg, 0); emit_op(cg, OP_SWAP); /* [hi, lo] */
+            }
+        }
         codegen_expr(cg, node->as.binary.right, st);
+        /* Promote right to long if needed */
+        if (node->type && node->type->kind == TYPE_LONG) {
+            if (node->as.binary.right->type && node->as.binary.right->type->kind != TYPE_LONG) {
+                emit_push(cg, 0); emit_op(cg, OP_SWAP); /* [hi, lo] */
+            }
+        }
 
+        /* Long (64-bit) integer arithmetic using temp memory slots */
+        if (node->type && node->type->kind == TYPE_LONG) {
+            /* Stack: [ahi, alo, bhi, blo], use temps at 240-244 */
+            int T_AHI = 240, T_ALO = 241, T_BHI = 242, T_BLO = 243, T_TMP = 244;
+            /* Save all to temps */
+            emit_push(cg, T_BLO); emit_op(cg, OP_SWAP); emit_op(cg, OP_STORE);
+            emit_push(cg, T_BHI); emit_op(cg, OP_SWAP); emit_op(cg, OP_STORE);
+            emit_push(cg, T_ALO); emit_op(cg, OP_SWAP); emit_op(cg, OP_STORE);
+            emit_push(cg, T_AHI); emit_op(cg, OP_SWAP); emit_op(cg, OP_STORE);
+            
+            if (op == TOK_PLUS || op == TOK_MINUS) {
+                /* Compute lo */
+                emit_push(cg, T_ALO); emit_op(cg, OP_LOAD);
+                emit_push(cg, T_BLO); emit_op(cg, OP_LOAD);
+                if (op == TOK_PLUS) emit_op(cg, OP_ADD); else emit_op(cg, OP_SUB);
+                emit_push(cg, T_TMP); emit_op(cg, OP_SWAP); emit_op(cg, OP_STORE); /* save lo result */
+                /* Compute carry/borrow */
+                emit_push(cg, T_ALO); emit_op(cg, OP_LOAD);
+                emit_push(cg, T_BLO); emit_op(cg, OP_LOAD);
+                if (op == TOK_PLUS) {
+                    emit_op(cg, OP_ADD);
+                    emit_push(cg, T_ALO); emit_op(cg, OP_LOAD);
+                    emit_op(cg, OP_LT_U); /* carry = (alo+blo) < alo */
+                } else {
+                    emit_op(cg, OP_LT_U); /* borrow = alo < blo */
+                }
+                /* Compute hi */
+                emit_push(cg, T_AHI); emit_op(cg, OP_LOAD);
+                emit_push(cg, T_BHI); emit_op(cg, OP_LOAD);
+                if (op == TOK_PLUS) emit_op(cg, OP_ADD); else emit_op(cg, OP_SUB);
+                emit_op(cg, OP_ADD); /* hi = ahi +/- bhi + carry */
+                /* Push result: [hi, lo] */
+                emit_push(cg, T_TMP); emit_op(cg, OP_LOAD); /* [hi, lo] */
+                emit_op(cg, OP_SWAP); /* [lo, hi]... need hi deep, lo on top */
+                /* Stack is [hi, lo], need [hi, lo] with lo on top? Actually current: hi deep, lo top */
+            }
+            if (op == TOK_EQ || op == TOK_NEQ) {
+                emit_push(cg, T_AHI); emit_op(cg, OP_LOAD);
+                emit_push(cg, T_BHI); emit_op(cg, OP_LOAD); emit_op(cg, OP_EQ);
+                emit_push(cg, T_ALO); emit_op(cg, OP_LOAD);
+                emit_push(cg, T_BLO); emit_op(cg, OP_LOAD); emit_op(cg, OP_EQ);
+                emit_op(cg, OP_AND);
+                if (op == TOK_NEQ) emit_op(cg, OP_EQZ);
+            }
+            if (op == TOK_LT || op == TOK_GT || op == TOK_LTE || op == TOK_GTE) {
+                bool is_unsigned = node->type->is_unsigned;
+                int hi_cmp_op = (op == TOK_LT || op == TOK_LTE) ?
+                    (is_unsigned ? OP_LT_U : OP_LT_S) : (is_unsigned ? OP_GT_U : OP_GT_S);
+                emit_push(cg, T_AHI); emit_op(cg, OP_LOAD);
+                emit_push(cg, T_BHI); emit_op(cg, OP_LOAD);
+                emit_op(cg, hi_cmp_op); /* hi_cmp result */
+                emit_push(cg, T_AHI); emit_op(cg, OP_LOAD);
+                emit_push(cg, T_BHI); emit_op(cg, OP_LOAD);
+                emit_op(cg, OP_EQ);    /* hi_eq */
+                emit_push(cg, T_ALO); emit_op(cg, OP_LOAD);
+                emit_push(cg, T_BLO); emit_op(cg, OP_LOAD);
+                emit_op(cg, is_unsigned ? OP_LT_U : OP_LT_U); /* lo_cmp */
+                emit_op(cg, OP_SWAP); /* [hi_cmp, lo_cmp, hi_eq] */
+                emit_op(cg, OP_AND);  /* [hi_cmp, lo_cmp && hi_eq] */
+                emit_op(cg, OP_OR);   /* [result] */
+                if (op == TOK_LTE || op == TOK_GTE) {
+                    emit_push(cg, T_AHI); emit_op(cg, OP_LOAD);
+                    emit_push(cg, T_BHI); emit_op(cg, OP_LOAD); emit_op(cg, OP_EQ);
+                    emit_push(cg, T_ALO); emit_op(cg, OP_LOAD);
+                    emit_push(cg, T_BLO); emit_op(cg, OP_LOAD); emit_op(cg, OP_EQ);
+                    emit_op(cg, OP_AND);
+                    emit_op(cg, OP_OR);
+                }
+            }
+            if (op == TOK_STAR || op == TOK_SLASH || op == TOK_PERCENT) {
+                /* 64-bit mul/div: reuse values already on stack */
+                emit_push(cg, T_AHI); emit_op(cg, OP_LOAD);
+                emit_push(cg, T_ALO); emit_op(cg, OP_LOAD);
+                emit_push(cg, T_BHI); emit_op(cg, OP_LOAD);
+                emit_push(cg, T_BLO); emit_op(cg, OP_LOAD);
+                if (op == TOK_STAR) emit_op(cg, OP_FMUL);
+                else if (op == TOK_SLASH) emit_op(cg, OP_FDIV);
+                else { emit_op(cg, OP_FDIV); /* % = approximate */ }
+            }
+            break;
+        }
+        
         /* Double arithmetic: use FPU opcodes */
         if (node->type && node->type->kind == TYPE_DOUBLE) {
             switch (op) {
@@ -472,14 +630,28 @@ static void codegen_expr(Codegen *cg, ASTNode *node, SymTable *st) {
         emit_op(cg, OP_LOAD);
         break;
 
+    case AST_BLOCK: {
+        /* Handle initializer list block: evaluate each element (values on stack) */
+        for (int i = 0; i < node->as.block.count; i++)
+            codegen_expr(cg, node->as.block.stmts[i], st);
+        break;
+    }
+
     case AST_MEMBER: {
-        /* Evaluate struct address, then add member byte offset (in words) */
+        /* Evaluate struct/union address, then add member offset.
+         * For aggregate members (struct/union/array), leave address on stack.
+         * For scalar members, also LOAD to push the value. */
+        bool is_aggregate = node->type && 
+            (node->type->kind == TYPE_STRUCT || node->type->kind == TYPE_UNION || 
+             node->type->kind == TYPE_ARRAY);
         codegen_expr(cg, node->as.member.obj, st);
         if (node->as.member.member && node->as.member.member->offset > 0) {
             emit_push(cg, (uint32_t)(node->as.member.member->offset / 4));
             emit_op(cg, OP_ADD);
         }
-        emit_op(cg, OP_LOAD);
+        if (!is_aggregate) {
+            emit_op(cg, OP_LOAD);
+        }
         break;
     }
 
@@ -500,6 +672,14 @@ static void codegen_expr(Codegen *cg, ASTNode *node, SymTable *st) {
         } else if (node->as.unary.expr->kind == AST_DEREF) {
             /* &*ptr == ptr */
             codegen_expr(cg, node->as.unary.expr->as.unary.expr, st);
+        } else if (node->as.unary.expr->kind == AST_MEMBER) {
+            /* &s.member: compute struct addr + member offset */
+            codegen_expr(cg, node->as.unary.expr->as.member.obj, st);
+            if (node->as.unary.expr->as.member.member &&
+                node->as.unary.expr->as.member.member->offset > 0) {
+                emit_push(cg, (uint32_t)(node->as.unary.expr->as.member.member->offset / 4));
+                emit_op(cg, OP_ADD);
+            }
         } else {
             fprintf(stderr, "s32-cc: & operator not supported for this expression\n");
             emit_push(cg, 0);
@@ -551,7 +731,24 @@ static void codegen_expr(Codegen *cg, ASTNode *node, SymTable *st) {
                 }
                 emit_op(cg, OP_STORE);
             } else if (s && (s->kind == SYM_LOCAL || s->kind == SYM_PARAM || s->kind == SYM_GLOBAL)) {
-                if (s->type && s->type->kind == TYPE_DOUBLE) {
+                if (s->kind == SYM_GLOBAL) {
+                    /* Absolute addressing for globals: push addr, store */
+                    if (s->type && (s->type->kind == TYPE_DOUBLE || s->type->kind == TYPE_LONG)) {
+                        /* Two-word globals: stack [hi, lo] */
+                        emit_op(cg, OP_OVER); emit_op(cg, OP_OVER);
+                        int addr = sym_addr(s);
+                        emit_push(cg, (uint32_t)(addr + 1));
+                        emit_op(cg, OP_SWAP);
+                        emit_op(cg, OP_STORE);  /* store hi at addr+1 */
+                        emit_push(cg, (uint32_t)addr);
+                        emit_op(cg, OP_SWAP);
+                        emit_op(cg, OP_STORE);  /* store lo at addr */
+                    } else {
+                        emit_op(cg, OP_DUP);
+                        emit_push(cg, (uint32_t)sym_addr(s));
+                        emit_op(cg, OP_STORE);
+                    }
+                } else if (s->type && (s->type->kind == TYPE_DOUBLE || s->type->kind == TYPE_LONG)) {
                     emit_local_set(cg, sym_addr(s));
                     emit_local_set(cg, sym_addr(s) + 1);
                     emit_local_get(cg, sym_addr(s) + 1);
@@ -564,26 +761,23 @@ static void codegen_expr(Codegen *cg, ASTNode *node, SymTable *st) {
                 fprintf(stderr, "s32-cc: assignment to non-lvalue at line %d\n", node->line);
             }
         } else {
-            /* Compound assignment: x op= expr
-             * We need: evaluate expr, load old x, perform op, store back, leave result */
+            /* Compound assignment: x op= expr */
+            int ca_op = node->as.assign.op;
             if (s && (s->kind == SYM_LOCAL || s->kind == SYM_PARAM || s->kind == SYM_GLOBAL)) {
                 int addr = sym_addr(s);
-                /* Evaluate RHS */
                 codegen_expr(cg, node->as.assign.rvalue, st);
-                /* Stack: [rhs] */
-                emit_local_get(cg, addr);
-                /* Stack: [rhs, old] */
-                switch (node->as.assign.op) {
+                if (s->kind == SYM_GLOBAL) {
+                    emit_push(cg, (uint32_t)addr);
+                    emit_op(cg, OP_LOAD);
+                } else {
+                    emit_local_get(cg, addr);
+                }
+                switch (ca_op) {
                     case TOK_PLUS_EQ:  emit_op(cg, OP_ADD); break;
                     case TOK_MINUS_EQ: emit_op(cg, OP_SWAP); emit_op(cg, OP_SUB); break;
                     case TOK_STAR_EQ:  emit_op(cg, OP_MUL); break;
                     case TOK_SLASH_EQ: emit_op(cg, OP_SWAP); emit_op(cg, OP_DIV_S); break;
-                    case TOK_PERCENT_EQ:
-                        emit_op(cg, OP_SWAP);
-                        emit_op(cg, OP_OVER); emit_op(cg, OP_OVER);
-                        emit_op(cg, OP_DIV_S);
-                        emit_op(cg, OP_MUL); emit_op(cg, OP_SUB);
-                        break;
+                    case TOK_PERCENT_EQ: emit_op(cg, OP_SWAP); emit_op(cg, OP_OVER); emit_op(cg, OP_OVER); emit_op(cg, OP_DIV_S); emit_op(cg, OP_MUL); emit_op(cg, OP_SUB); break;
                     case TOK_AMP_EQ:   emit_op(cg, OP_AND); break;
                     case TOK_PIPE_EQ:  emit_op(cg, OP_OR); break;
                     case TOK_CARET_EQ: emit_op(cg, OP_XOR); break;
@@ -591,10 +785,71 @@ static void codegen_expr(Codegen *cg, ASTNode *node, SymTable *st) {
                     case TOK_SHR_EQ:   emit_op(cg, OP_SWAP); emit_op(cg, OP_SHR_S); break;
                     default: break;
                 }
-                /* Stack: [result] */
                 emit_op(cg, OP_DUP);
-                emit_local_set(cg, addr);
-                /* Stack: [result] */
+                if (s->kind == SYM_GLOBAL) {
+                    emit_push(cg, (uint32_t)addr);
+                    emit_op(cg, OP_STORE);
+                } else {
+                    emit_local_set(cg, addr);
+                }
+            } else if (through_ptr || through_index || through_member) {
+                /* For complex lvalues: compute lvalue addr once, save it,
+                 * then evaluate rhs, load old, compute result, dup, store.
+                 * This ensures the lvalue is evaluated exactly once. */
+                
+                /* Compute lvalue addr and save it */
+                if (through_ptr) {
+                    codegen_expr(cg, node->as.assign.lvalue->as.unary.expr, st);  /* [ptr] */
+                } else if (through_index) {
+                    codegen_expr(cg, node->as.assign.lvalue->as.index.base, st);
+                    codegen_expr(cg, node->as.assign.lvalue->as.index.index, st);
+                    if (node->as.assign.lvalue->type) {
+                        int ws = (type_sizeof(node->as.assign.lvalue->type) + 3) / 4;
+                        if (ws > 1) {
+                            emit_push(cg, (uint32_t)(ws == 2 ? 1 : 2));
+                            for (int k = 0; k < (ws == 2 ? 1 : ws == 4 ? 2 : 0); k++)
+                                emit_op(cg, OP_SHL);
+                            if (ws != 2 && ws != 4) {
+                                emit_push(cg, (uint32_t)ws);
+                                emit_op(cg, OP_MUL);
+                            }
+                        }
+                    }
+                    emit_op(cg, OP_ADD);
+                } else {
+                    codegen_expr(cg, node->as.assign.lvalue->as.member.obj, st);
+                    if (node->as.assign.lvalue->as.member.member &&
+                        node->as.assign.lvalue->as.member.member->offset > 0) {
+                        emit_push(cg, (uint32_t)(node->as.assign.lvalue->as.member.member->offset / 4));
+                        emit_op(cg, OP_ADD);
+                    }
+                }
+                /* Stack: [addr] - save it */
+                emit_op(cg, OP_DUP);               /* [addr, addr] */
+                emit_op(cg, OP_LOAD);              /* [addr, old] */
+                
+                /* evaluate rhs */
+                codegen_expr(cg, node->as.assign.rvalue, st);  /* [addr, old, rhs] */
+                
+                /* Stack: [addr, old, rhs] */
+                switch (ca_op) {
+                    case TOK_PLUS_EQ:  emit_op(cg, OP_ADD); break;
+                    case TOK_MINUS_EQ: emit_op(cg, OP_SUB); break;
+                    case TOK_STAR_EQ:  emit_op(cg, OP_MUL); break;
+                    case TOK_SLASH_EQ: emit_op(cg, OP_DIV_S); break;
+                    case TOK_PERCENT_EQ: emit_op(cg, OP_OVER); emit_op(cg, OP_OVER); emit_op(cg, OP_DIV_S); emit_op(cg, OP_MUL); emit_op(cg, OP_SUB); break;
+                    case TOK_AMP_EQ:   emit_op(cg, OP_AND); break;
+                    case TOK_PIPE_EQ:  emit_op(cg, OP_OR); break;
+                    case TOK_CARET_EQ: emit_op(cg, OP_XOR); break;
+                    case TOK_SHL_EQ:   emit_op(cg, OP_SHL); break;
+                    case TOK_SHR_EQ:   emit_op(cg, OP_SHR_S); break;
+                    default: break;
+                }
+                /* Stack: [addr, result] */
+                emit_op(cg, OP_SWAP);              /* [result, addr] */
+                emit_op(cg, OP_OVER);              /* [result, addr, result] */
+                emit_op(cg, OP_SWAP);              /* [result, result, addr] */
+                emit_op(cg, OP_STORE);             /* [result] */
             } else {
                 fprintf(stderr, "s32-cc: assignment to non-lvalue at line %d\n", node->line);
                 codegen_expr(cg, node->as.assign.rvalue, st);
@@ -605,6 +860,12 @@ static void codegen_expr(Codegen *cg, ASTNode *node, SymTable *st) {
 
     case AST_CALL: {
         if (node->as.call.func->kind == AST_IDENT) {
+            /* Check if this is a function name or a function pointer variable */
+            Symbol *func_sym = symtable_lookup(st, node->as.call.func->as.ident);
+            /* Direct call if: symbol not found (forward decl) OR it's a function */
+            bool is_direct = !func_sym || func_sym->kind == SYM_FUNC;
+            
+            if (is_direct) {
             const char *name = node->as.call.func->as.ident;
 
             /* Built-in intrinsics */
@@ -633,6 +894,77 @@ static void codegen_expr(Codegen *cg, ASTNode *node, SymTable *st) {
                 emit_push(cg, 0); /* dummy for expression-statement DROP */
                 break;
             }
+            if (strcmp(name, "puts") == 0) {
+                /* puts(str): print chars until null, then newline.
+                 * Addresses are word indices, so multiply by 4 for load8_u byte access. */
+                if (node->as.call.arg_count >= 1) {
+                    codegen_expr(cg, node->as.call.args[0], st); /* push str ptr (word idx) */
+                    char *lbl_loop = sc_label();
+                    char *lbl_end = sc_label();
+                    add_label(cg, lbl_loop);
+                    emit_op(cg, OP_DUP);        /* [ptr, ptr] */
+                    emit_op(cg, OP_LOAD);       /* [ptr, word] - read whole word */
+                    emit_push(cg, 0xFF);
+                    emit_op(cg, OP_AND);        /* [ptr, byte & 0xFF] */
+                    emit_op(cg, OP_DUP);        /* [ptr, byte, byte] */
+                    emit_op(cg, OP_EQZ);        /* [ptr, byte, byte==0] */
+                    int br_pos = cg->code_len;
+                    emit_op(cg, OP_BR_IF);
+                    add_fixup(cg, br_pos, lbl_end);
+                    emit_u32(cg, 0);
+                    emit_op(cg, OP_PRINT);      /* [ptr] */
+                    emit_push(cg, 1);
+                    emit_op(cg, OP_ADD);        /* [ptr+1] - next word */
+                    int jmp_pos = cg->code_len;
+                    emit_op(cg, OP_JUMP);
+                    add_fixup(cg, jmp_pos, lbl_loop);
+                    emit_u32(cg, 0);
+                    add_label(cg, lbl_end);
+                    emit_op(cg, OP_DROP);       /* drop byte */
+                    emit_op(cg, OP_DROP);       /* drop ptr */
+                    emit_push(cg, 10);          /* newline */
+                    emit_op(cg, OP_PRINT);
+                    free(lbl_loop);
+                    free(lbl_end);
+                }
+                emit_push(cg, 0);
+                break;
+            }
+            if (strcmp(name, "sysenter") == 0) {
+                /* syscall: push sys_num, sysenter */
+                if (node->as.call.arg_count >= 1)
+                    codegen_expr(cg, node->as.call.args[0], st);
+                else emit_push(cg, 0);
+                emit_op(cg, OP_SYSENTER);
+                emit_push(cg, 0);
+                break;
+            }
+            if (strcmp(name, "eret") == 0) {
+                emit_op(cg, OP_ERET);
+                emit_push(cg, 0);
+                break;
+            }
+            if (strcmp(name, "csr_read") == 0) {
+                /* csr_read(id): emits opcode + immediate id */
+                emit_op(cg, OP_CSR_READ);
+                if (node->as.call.arg_count >= 1) {
+                    /* Push ID as immediate - use codegen_expr to evaluate constant */
+                    codegen_expr(cg, node->as.call.args[0], st);
+                    /* Hmm, this pushes to stack. CSR_READ takes immediate... */
+                }
+                emit_u32(cg, 0); /* placeholder id */
+                break;
+            }
+            if (strcmp(name, "csr_write") == 0) {
+                /* csr_write(id, val): emits opcode + immediate id */
+                if (node->as.call.arg_count >= 2)
+                    codegen_expr(cg, node->as.call.args[1], st); /* push val */
+                else emit_push(cg, 0);
+                emit_op(cg, OP_CSR_WRITE);
+                emit_u32(cg, 0); /* placeholder id */
+                emit_push(cg, 0);
+                break;
+            }
 
             /* Regular function call - push args L-to-R, callee pops in reverse */
             for (int i = 0; i < node->as.call.arg_count; i++)
@@ -643,64 +975,297 @@ static void codegen_expr(Codegen *cg, ASTNode *node, SymTable *st) {
             emit_op(cg, OP_CALL);
             add_fixup(cg, call_pos, name);
             emit_u32(cg, 0); /* placeholder */
+            } else {
+                /* Function pointer via variable name: fp(args) */
+                for (int i = 0; i < node->as.call.arg_count; i++)
+                    codegen_expr(cg, node->as.call.args[i], st);
+                emit_push_frame_size(cg);
+                codegen_expr(cg, node->as.call.func, st);
+                emit_op(cg, OP_CALL_IND);
+            }
+        } else {
+            /* Function pointer call: (*fp)(args) or fp(args) */
+            for (int i = 0; i < node->as.call.arg_count; i++)
+                codegen_expr(cg, node->as.call.args[i], st);
+            emit_push_frame_size(cg);
+            /* Evaluate function pointer to get target address */
+            codegen_expr(cg, node->as.call.func, st);
+            emit_op(cg, OP_CALL_IND);
         }
         break;
     }
 
     case AST_POSTINC: {
-        Symbol *s = NULL;
-        if (node->as.unary.expr->kind == AST_IDENT)
-            s = symtable_lookup(st, node->as.unary.expr->as.ident);
-        if (s) {
-            emit_local_get(cg, sym_addr(s));
-            emit_op(cg, OP_DUP);
+        if (node->as.unary.expr->kind == AST_IDENT) {
+            Symbol *s = symtable_lookup(st, node->as.unary.expr->as.ident);
+            if (s) {
+                if (s->kind == SYM_GLOBAL) {
+                    int addr = sym_addr(s);
+                    emit_push(cg, (uint32_t)addr);
+                    emit_op(cg, OP_LOAD);
+                    emit_op(cg, OP_DUP);
+                    emit_push(cg, 1);
+                    emit_op(cg, OP_ADD);
+                    emit_push(cg, (uint32_t)addr);
+                    emit_op(cg, OP_STORE);
+                } else {
+                    emit_local_get(cg, sym_addr(s));
+                    emit_op(cg, OP_DUP);
+                    emit_push(cg, 1);
+                    emit_op(cg, OP_ADD);
+                    emit_local_set(cg, sym_addr(s));
+                }
+            }
+        } else if (node->as.unary.expr->kind == AST_DEREF) {
+            /* *ptr++ : save old value, increment *ptr */
+            ASTNode *ptr_expr = node->as.unary.expr->as.unary.expr;
+            codegen_expr(cg, ptr_expr, st);  /* push ptr */
+            emit_op(cg, OP_DUP);             /* [ptr, ptr] */
+            emit_op(cg, OP_LOAD);            /* [ptr, old] */
+            emit_op(cg, OP_SWAP);            /* [old, ptr] */
+            emit_op(cg, OP_DUP);             /* [old, ptr, ptr] */
+            emit_op(cg, OP_LOAD);            /* [old, ptr, old] */
             emit_push(cg, 1);
-            emit_op(cg, OP_ADD);
-            emit_local_set(cg, sym_addr(s));
+            emit_op(cg, OP_ADD);             /* [old, ptr, new] */
+            emit_op(cg, OP_SWAP);            /* [old, new, ptr] */
+            emit_op(cg, OP_STORE);           /* [old] */
+        } else if (node->as.unary.expr->kind == AST_MEMBER) {
+            /* s.member++ : compute member addr once, use load/store */
+            ASTNode *obj = node->as.unary.expr->as.member.obj;
+            int moff = 0;
+            if (node->as.unary.expr->as.member.member)
+                moff = node->as.unary.expr->as.member.member->offset / 4;
+            codegen_expr(cg, obj, st);
+            if (moff > 0) { emit_push(cg, (uint32_t)moff); emit_op(cg, OP_ADD); }
+            emit_op(cg, OP_DUP);             /* dup addr */
+            emit_op(cg, OP_LOAD);            /* load member value */
+            emit_op(cg, OP_SWAP);            /* swap: [old_val, addr] */
+            emit_op(cg, OP_DUP);             /* dup addr: [old_val, addr, addr] */
+            emit_op(cg, OP_LOAD);            /* load member again: [old_val, addr, val] */
+            emit_push(cg, 1);
+            emit_op(cg, OP_ADD);             /* val + 1 */
+            emit_op(cg, OP_SWAP);
+            emit_op(cg, OP_STORE);           /* store back */
+            /* result (old value) is on stack */
+        } else if (node->as.unary.expr->kind == AST_INDEX) {
+            /* arr[i]++ : compute addr, load old, inc, store back, leave old */
+            ASTNode *idx = node->as.unary.expr;
+            codegen_expr(cg, idx->as.index.base, st);
+            codegen_expr(cg, idx->as.index.index, st);
+            if (idx->type) {
+                int ws = (type_sizeof(idx->type) + 3) / 4;
+                if (ws > 1) {
+                    emit_push(cg, (uint32_t)(ws == 2 ? 1 : 2));
+                    for (int k = 0; k < (ws == 2 ? 1 : ws == 4 ? 2 : 0); k++)
+                        emit_op(cg, OP_SHL);
+                    if (ws != 2 && ws != 4) {
+                        emit_push(cg, (uint32_t)ws);
+                        emit_op(cg, OP_MUL);
+                    }
+                }
+            }
+            emit_op(cg, OP_ADD);             /* [addr] */
+            emit_op(cg, OP_DUP);             /* [addr, addr] */
+            emit_op(cg, OP_LOAD);            /* [addr, old] */
+            emit_op(cg, OP_SWAP);            /* [old, addr] */
+            emit_op(cg, OP_DUP);             /* [old, addr, addr] */
+            emit_op(cg, OP_LOAD);            /* [old, addr, old] */
+            emit_push(cg, 1);
+            emit_op(cg, OP_ADD);             /* [old, addr, new] */
+            emit_op(cg, OP_SWAP);            /* [old, new, addr] */
+            emit_op(cg, OP_STORE);           /* [old] */
         }
         break;
     }
 
     case AST_POSTDEC: {
-        Symbol *s = NULL;
-        if (node->as.unary.expr->kind == AST_IDENT)
-            s = symtable_lookup(st, node->as.unary.expr->as.ident);
-        if (s) {
-            emit_local_get(cg, sym_addr(s));
+        if (node->as.unary.expr->kind == AST_IDENT) {
+            Symbol *s = symtable_lookup(st, node->as.unary.expr->as.ident);
+            if (s) {
+                if (s->kind == SYM_GLOBAL) {
+                    int addr = sym_addr(s);
+                    emit_push(cg, (uint32_t)addr);
+                    emit_op(cg, OP_LOAD);
+                    emit_op(cg, OP_DUP);
+                    emit_push(cg, 1);
+                    emit_op(cg, OP_SUB);
+                    emit_push(cg, (uint32_t)addr);
+                    emit_op(cg, OP_STORE);
+                } else {                    emit_local_get(cg, sym_addr(s));
+                    emit_op(cg, OP_DUP);
+                    emit_push(cg, 1);
+                    emit_op(cg, OP_SUB);
+                    emit_local_set(cg, sym_addr(s));
+                }
+            }
+        } else if (node->as.unary.expr->kind == AST_DEREF) {
+            ASTNode *ptr_expr = node->as.unary.expr->as.unary.expr;
+            codegen_expr(cg, ptr_expr, st);
             emit_op(cg, OP_DUP);
+            emit_op(cg, OP_LOAD);
+            emit_op(cg, OP_SWAP);
+            emit_op(cg, OP_DUP);
+            emit_op(cg, OP_LOAD);
             emit_push(cg, 1);
             emit_op(cg, OP_SUB);
-            emit_local_set(cg, sym_addr(s));
+            emit_op(cg, OP_SWAP);
+            emit_op(cg, OP_STORE);
+        } else if (node->as.unary.expr->kind == AST_MEMBER) {
+            ASTNode *obj = node->as.unary.expr->as.member.obj;
+            int moff = 0;
+            if (node->as.unary.expr->as.member.member)
+                moff = node->as.unary.expr->as.member.member->offset / 4;
+            codegen_expr(cg, obj, st);
+            if (moff > 0) { emit_push(cg, (uint32_t)moff); emit_op(cg, OP_ADD); }
+            emit_op(cg, OP_DUP);
+            emit_op(cg, OP_LOAD);
+            emit_op(cg, OP_SWAP);
+            emit_op(cg, OP_DUP);
+            emit_op(cg, OP_LOAD);
+            emit_push(cg, 1);
+            emit_op(cg, OP_SUB);
+            emit_op(cg, OP_SWAP);
+            emit_op(cg, OP_STORE);
+        } else if (node->as.unary.expr->kind == AST_INDEX) {
+            /* arr[i]-- : compute addr, load old, dec, store back, leave old */
+            ASTNode *idx = node->as.unary.expr;
+            codegen_expr(cg, idx->as.index.base, st);
+            codegen_expr(cg, idx->as.index.index, st);
+            if (idx->type) {
+                int ws = (type_sizeof(idx->type) + 3) / 4;
+                if (ws > 1) { emit_push(cg, (uint32_t)(ws == 2 ? 1 : 2)); for (int k = 0; k < (ws == 2 ? 1 : ws == 4 ? 2 : 0); k++) emit_op(cg, OP_SHL); if (ws != 2 && ws != 4) { emit_push(cg, (uint32_t)ws); emit_op(cg, OP_MUL); } }
+            }
+            emit_op(cg, OP_ADD);
+            emit_op(cg, OP_DUP); emit_op(cg, OP_LOAD); emit_op(cg, OP_SWAP);
+            emit_op(cg, OP_DUP); emit_op(cg, OP_LOAD);
+            emit_push(cg, 1); emit_op(cg, OP_SUB);
+            emit_op(cg, OP_SWAP); emit_op(cg, OP_STORE);
         }
         break;
     }
 
     case AST_PREINC: {
-        Symbol *s = NULL;
-        if (node->as.unary.expr->kind == AST_IDENT)
-            s = symtable_lookup(st, node->as.unary.expr->as.ident);
-        if (s) {
-            emit_local_get(cg, sym_addr(s));
+        if (node->as.unary.expr->kind == AST_IDENT) {
+            Symbol *s = symtable_lookup(st, node->as.unary.expr->as.ident);
+            if (s) {
+                if (s->kind == SYM_GLOBAL) {
+                    int addr = sym_addr(s);
+                    emit_push(cg, (uint32_t)addr);
+                    emit_op(cg, OP_LOAD);
+                    emit_push(cg, 1);
+                    emit_op(cg, OP_ADD);
+                    emit_op(cg, OP_DUP);
+                    emit_push(cg, (uint32_t)addr);
+                    emit_op(cg, OP_STORE);
+                } else {                    emit_local_get(cg, sym_addr(s));
+                    emit_push(cg, 1);
+                    emit_op(cg, OP_ADD);
+                    emit_op(cg, OP_DUP);
+                    emit_local_set(cg, sym_addr(s));
+                }
+            }
+        } else if (node->as.unary.expr->kind == AST_DEREF) {
+            ASTNode *ptr_expr = node->as.unary.expr->as.unary.expr;
+            codegen_expr(cg, ptr_expr, st);    /* [ptr] */
+            emit_op(cg, OP_DUP);               /* [ptr, ptr] */
+            emit_op(cg, OP_LOAD);              /* [ptr, old] */
             emit_push(cg, 1);
-            emit_op(cg, OP_ADD);
+            emit_op(cg, OP_ADD);               /* [ptr, new] */
+            emit_op(cg, OP_SWAP);              /* [new, ptr] */
+            emit_op(cg, OP_OVER);              /* [new, ptr, new] */
+            emit_op(cg, OP_SWAP);              /* [new, new, ptr] */
+            emit_op(cg, OP_STORE);             /* [new] */
+        } else if (node->as.unary.expr->kind == AST_MEMBER) {
+            ASTNode *obj = node->as.unary.expr->as.member.obj;
+            int moff = 0;
+            if (node->as.unary.expr->as.member.member)
+                moff = node->as.unary.expr->as.member.member->offset / 4;
+            codegen_expr(cg, obj, st);
+            if (moff > 0) { emit_push(cg, (uint32_t)moff); emit_op(cg, OP_ADD); }
             emit_op(cg, OP_DUP);
-            emit_local_set(cg, sym_addr(s));
+            emit_op(cg, OP_LOAD);
+            emit_push(cg, 1);
+             emit_op(cg, OP_ADD);
+             emit_op(cg, OP_SWAP);
+             emit_op(cg, OP_OVER);
+             emit_op(cg, OP_STORE);
+         } else if (node->as.unary.expr->kind == AST_INDEX) {
+            /* ++arr[i] */
+            ASTNode *idx = node->as.unary.expr;
+            codegen_expr(cg, idx->as.index.base, st);
+            codegen_expr(cg, idx->as.index.index, st);
+            if (idx->type) {
+                int ws = (type_sizeof(idx->type) + 3) / 4;
+                if (ws > 1) { emit_push(cg, (uint32_t)(ws == 2 ? 1 : 2)); for (int k = 0; k < (ws == 2 ? 1 : ws == 4 ? 2 : 0); k++) emit_op(cg, OP_SHL); if (ws != 2 && ws != 4) { emit_push(cg, (uint32_t)ws); emit_op(cg, OP_MUL); } }
+            }
+            emit_op(cg, OP_ADD);
+            emit_op(cg, OP_DUP); emit_op(cg, OP_LOAD);
+            emit_push(cg, 1); emit_op(cg, OP_ADD);
+            emit_op(cg, OP_SWAP); emit_op(cg, OP_DUP); emit_op(cg, OP_SWAP); emit_op(cg, OP_STORE);
         }
-        break;
+         break;
     }
 
     case AST_PREDEC: {
-        Symbol *s = NULL;
-        if (node->as.unary.expr->kind == AST_IDENT)
-            s = symtable_lookup(st, node->as.unary.expr->as.ident);
-        if (s) {
-            emit_local_get(cg, sym_addr(s));
+        if (node->as.unary.expr->kind == AST_IDENT) {
+            Symbol *s = symtable_lookup(st, node->as.unary.expr->as.ident);
+            if (s) {
+                if (s->kind == SYM_GLOBAL) {
+                    int addr = sym_addr(s);
+                    emit_push(cg, (uint32_t)addr);
+                    emit_op(cg, OP_LOAD);
+                    emit_push(cg, 1);
+                    emit_op(cg, OP_SUB);
+                    emit_op(cg, OP_DUP);
+                    emit_push(cg, (uint32_t)addr);
+                    emit_op(cg, OP_STORE);
+                } else {                    emit_local_get(cg, sym_addr(s));
+                    emit_push(cg, 1);
+                    emit_op(cg, OP_SUB);
+                    emit_op(cg, OP_DUP);
+                    emit_local_set(cg, sym_addr(s));
+                }
+            }
+        } else if (node->as.unary.expr->kind == AST_DEREF) {
+            ASTNode *ptr_expr = node->as.unary.expr->as.unary.expr;
+            codegen_expr(cg, ptr_expr, st);    /* [ptr] */
+            emit_op(cg, OP_DUP);               /* [ptr, ptr] */
+            emit_op(cg, OP_LOAD);              /* [ptr, old] */
             emit_push(cg, 1);
-            emit_op(cg, OP_SUB);
+            emit_op(cg, OP_SUB);               /* [ptr, new] */
+            emit_op(cg, OP_SWAP);              /* [new, ptr] */
+            emit_op(cg, OP_OVER);              /* [new, ptr, new] */
+            emit_op(cg, OP_SWAP);              /* [new, new, ptr] */
+            emit_op(cg, OP_STORE);             /* [new] */
+        } else if (node->as.unary.expr->kind == AST_MEMBER) {
+            ASTNode *obj = node->as.unary.expr->as.member.obj;
+            int moff = 0;
+            if (node->as.unary.expr->as.member.member)
+                moff = node->as.unary.expr->as.member.member->offset / 4;
+            codegen_expr(cg, obj, st);
+            if (moff > 0) { emit_push(cg, (uint32_t)moff); emit_op(cg, OP_ADD); }
             emit_op(cg, OP_DUP);
-            emit_local_set(cg, sym_addr(s));
+            emit_op(cg, OP_LOAD);
+            emit_push(cg, 1);
+             emit_op(cg, OP_SUB);
+             emit_op(cg, OP_SWAP);
+             emit_op(cg, OP_OVER);
+             emit_op(cg, OP_STORE);
+         } else if (node->as.unary.expr->kind == AST_INDEX) {
+            /* --arr[i] */
+            ASTNode *idx = node->as.unary.expr;
+            codegen_expr(cg, idx->as.index.base, st);
+            codegen_expr(cg, idx->as.index.index, st);
+            if (idx->type) {
+                int ws = (type_sizeof(idx->type) + 3) / 4;
+                if (ws > 1) { emit_push(cg, (uint32_t)(ws == 2 ? 1 : 2)); for (int k = 0; k < (ws == 2 ? 1 : ws == 4 ? 2 : 0); k++) emit_op(cg, OP_SHL); if (ws != 2 && ws != 4) { emit_push(cg, (uint32_t)ws); emit_op(cg, OP_MUL); } }
+            }
+            emit_op(cg, OP_ADD);
+            emit_op(cg, OP_DUP); emit_op(cg, OP_LOAD);
+            emit_push(cg, 1); emit_op(cg, OP_SUB);
+            emit_op(cg, OP_SWAP); emit_op(cg, OP_DUP); emit_op(cg, OP_SWAP); emit_op(cg, OP_STORE);
         }
-        break;
+         break;
     }
 
     case AST_INDEX: {
@@ -765,14 +1330,47 @@ static void codegen_stmt(Codegen *cg, ASTNode *node, SymTable *st) {
 
     case AST_VAR_DECL:
         {
+            if (node->as.var_decl.is_extern) {
+                /* extern declaration: register in scope with correct offset from global.
+                 * Search up to the top-most scope to find the external definition. */
+                Symbol *gs = symtable_lookup(st, node->as.var_decl.name);
+                /* Walk to the top parent to find the real global definition */
+                SymTable *top_scope = st;
+                while (top_scope->parent) top_scope = top_scope->parent;
+                Symbol *real_gs = symtable_lookup(top_scope, node->as.var_decl.name);
+                Symbol *ns = symtable_insert(st, node->as.var_decl.name, node->as.var_decl.type, SYM_GLOBAL);
+                if (real_gs && real_gs->kind == SYM_GLOBAL) ns->offset = real_gs->offset;
+                else if (gs && gs->kind == SYM_GLOBAL) ns->offset = gs->offset;
+                break;
+            }
+            /* Check current scope only for existing declaration */
             Symbol *s = symtable_lookup_local(st, node->as.var_decl.name);
             if (!s) {
+                if (node->as.var_decl.is_static && node->as.var_decl.static_offset >= 0) {
+                    /* static local: use pre-allocated global offset */
+                    s = symtable_insert(st, node->as.var_decl.name, node->as.var_decl.type, SYM_GLOBAL);
+                    s->offset = node->as.var_decl.static_offset;
+                    /* do NOT emit init code - it was done in __init */
+                    break;
+                }
                 s = symtable_insert(st, node->as.var_decl.name, node->as.var_decl.type, SYM_LOCAL);
                 s->offset = cg->next_var_addr;
-                int slots = type_sizeof(node->as.var_decl.type) / 4;
-                if (slots < 1) slots = 1;
+                int slots;
+                /* char types need 1 word per element on word-addressed machine */
+                if (node->as.var_decl.type && node->as.var_decl.type->kind == TYPE_ARRAY &&
+                    node->as.var_decl.type->base->size == 1) {
+                    slots = node->as.var_decl.type->size; /* array length */
+                } else {
+                    slots = type_sizeof(node->as.var_decl.type) / 4;
+                    if (slots < 1) slots = 1;
+                }
                 cg->next_var_addr += slots;
             }
+            if (node->as.var_decl.is_static) {
+                /* static local: no runtime init, skip */
+                break;
+            }
+        /* init code continues below */
             if (node->as.var_decl.init) {
                 if (node->as.var_decl.init->kind == AST_STRING_LIT &&
                     node->as.var_decl.type && node->as.var_decl.type->kind == TYPE_ARRAY) {
@@ -795,9 +1393,22 @@ static void codegen_stmt(Codegen *cg, ASTNode *node, SymTable *st) {
                         emit_op(cg, OP_ADD);
                         emit_op(cg, OP_STORE);
                     }
+                } else if (node->as.var_decl.init->kind == AST_BLOCK &&
+                           node->as.var_decl.type && 
+                           (node->as.var_decl.type->kind == TYPE_STRUCT || node->as.var_decl.type->kind == TYPE_UNION)) {
+                    /* Struct/union initializer: store each member at its offset */
+                    Member *m = node->as.var_decl.type->members;
+                    for (int i = 0; i < node->as.var_decl.init->as.block.count && m; i++) {
+                        codegen_expr(cg, node->as.var_decl.init->as.block.stmts[i], st);
+                        emit_op(cg, OP_GET_FP);
+                        emit_push(cg, (uint32_t)(sym_addr(s) + m->offset / 4));
+                        emit_op(cg, OP_ADD);
+                        emit_op(cg, OP_STORE);
+                        m = m->next;
+                    }
                 } else {
                     codegen_expr(cg, node->as.var_decl.init, st);
-                    if (node->as.var_decl.type && node->as.var_decl.type->kind == TYPE_DOUBLE) {
+                    if (node->as.var_decl.type && (node->as.var_decl.type->kind == TYPE_DOUBLE || node->as.var_decl.type->kind == TYPE_LONG)) {
                         emit_local_set(cg, sym_addr(s));
                         emit_local_set(cg, sym_addr(s) + 1);
                     } else {
@@ -806,7 +1417,7 @@ static void codegen_stmt(Codegen *cg, ASTNode *node, SymTable *st) {
                 }
             } else {
                 emit_push(cg, 0);
-                if (node->as.var_decl.type && node->as.var_decl.type->kind == TYPE_DOUBLE) {
+                if (node->as.var_decl.type && (node->as.var_decl.type->kind == TYPE_DOUBLE || node->as.var_decl.type->kind == TYPE_LONG)) {
                     emit_push(cg, 0);
                     emit_local_set(cg, sym_addr(s));
                     emit_local_set(cg, sym_addr(s) + 1);
@@ -826,9 +1437,14 @@ static void codegen_stmt(Codegen *cg, ASTNode *node, SymTable *st) {
     }
 
     case AST_RETURN:
-        if (node->as.ret.expr)
+        if (node->as.ret.expr) {
             codegen_expr(cg, node->as.ret.expr, st);
-        else
+            /* Promote return value to match function return type */
+            if (cg->current_return_type && cg->current_return_type->kind == TYPE_LONG &&
+                node->as.ret.expr->type && node->as.ret.expr->type->kind != TYPE_LONG) {
+                emit_push(cg, 0); emit_op(cg, OP_SWAP);
+            }
+        } else
             emit_push(cg, 0);
         emit_op(cg, OP_RETURN);
         break;
@@ -976,6 +1592,15 @@ static void codegen_stmt(Codegen *cg, ASTNode *node, SymTable *st) {
     case AST_NULL_STMT:
         break;
 
+    case AST_FUNC_DECL:
+        /* Function prototype inside block - register in symtable */
+        if (!node->as.func_decl.body) {
+            Type *fty = type_func(node->as.func_decl.return_type, NULL,
+                                  node->as.func_decl.param_count, false);
+            symtable_insert(st, node->as.func_decl.name, fty, SYM_FUNC);
+        }
+        break;
+
     case AST_LABEL: {
         char label_name[256];
         snprintf(label_name, sizeof(label_name), ".L%s", node->as.label.name);
@@ -1082,6 +1707,9 @@ static void codegen_func(Codegen *cg, ASTNode *node, SymTable *st) {
 
     /* Create function label */
     add_label(cg, node->as.func_decl.name);
+
+    /* Track return type for promotion */
+    cg->current_return_type = node->as.func_decl.return_type;
 
     /* Create a child scope for params + locals */
     SymTable *func_st = symtable_new(st);
@@ -1191,6 +1819,53 @@ static void peephole_optimize(Codegen *cg) {
 
 /* Top-level program codegen */
 
+/* Walk AST recursively to collect static local var decls into a list */
+static void collect_static_locals(ASTNode *node, ASTNode ***out_list, int *out_count, int *out_cap) {
+    if (!node) return;
+    if (node->kind == AST_VAR_DECL && node->as.var_decl.is_static) {
+        if (*out_count >= *out_cap) {
+            *out_cap = *out_cap ? *out_cap * 2 : 16;
+            *out_list = realloc(*out_list, sizeof(ASTNode*) * (*out_cap));
+        }
+        (*out_list)[(*out_count)++] = node;
+        return;
+    }
+    if (node->kind == AST_BLOCK) {
+        for (int i = 0; i < node->as.block.count; i++)
+            collect_static_locals(node->as.block.stmts[i], out_list, out_count, out_cap);
+        return;
+    }
+    if (node->kind == AST_IF) {
+        collect_static_locals(node->as.if_.then_body, out_list, out_count, out_cap);
+        collect_static_locals(node->as.if_.else_body, out_list, out_count, out_cap);
+        return;
+    }
+    if (node->kind == AST_WHILE) {
+        collect_static_locals(node->as.while_.body, out_list, out_count, out_cap);
+        return;
+    }
+    if (node->kind == AST_FOR) {
+        collect_static_locals(node->as.for_.body, out_list, out_count, out_cap);
+        return;
+    }
+    if (node->kind == AST_DO_WHILE) {
+        collect_static_locals(node->as.do_while.body, out_list, out_count, out_cap);
+        return;
+    }
+    if (node->kind == AST_SWITCH) {
+        collect_static_locals(node->as.switch_.body, out_list, out_count, out_cap);
+        return;
+    }
+    if (node->kind == AST_CASE) {
+        collect_static_locals(node->as.case_.body, out_list, out_count, out_cap);
+        return;
+    }
+    if (node->kind == AST_LABEL) {
+        collect_static_locals(node->as.label.stmt, out_list, out_count, out_cap);
+        return;
+    }
+}
+
 void codegen_program(Codegen *cg, ASTNode *node, FILE *out) {
     cg->out = out;
 
@@ -1213,35 +1888,147 @@ void codegen_program(Codegen *cg, ASTNode *node, FILE *out) {
     /* We need a global symbol table... let's create one here */
     SymTable *top = symtable_new(NULL);
 
-    /* Emit _start stub: call main, then halt */
+    /* Allocate global variable slots (create symbols) */
+    for (int i = 0; i < node->as.block.count; i++) {
+        ASTNode *d = node->as.block.stmts[i];
+        if (d && d->kind == AST_VAR_DECL) {
+            if (!symtable_lookup(top, d->as.var_decl.name)) {
+                Symbol *s = symtable_insert(top, d->as.var_decl.name,
+                                             d->as.var_decl.type, SYM_GLOBAL);
+                s->offset = cg->next_var_addr;
+                int slots = 1;
+                if (d->as.var_decl.type && d->as.var_decl.type->kind == TYPE_ARRAY &&
+                    d->as.var_decl.type->base->size == 1)
+                    slots = d->as.var_decl.type->size;
+                else {
+                    slots = type_sizeof(d->as.var_decl.type) / 4;
+                    if (slots < 1) slots = 1;
+                }
+                cg->next_var_addr += slots;
+            }
+        }
+        /* For functions, walk body recursively for static locals */
+        if (d && d->kind == AST_FUNC_DECL && d->as.func_decl.body) {
+            ASTNode **statics = NULL;
+            int scount = 0, scap = 0;
+            collect_static_locals(d->as.func_decl.body, &statics, &scount, &scap);
+            for (int j = 0; j < scount; j++) {
+                ASTNode *bstmt = statics[j];
+                char sname[256];
+                snprintf(sname, sizeof(sname), "__s_%s_%s_%d",
+                         d->as.func_decl.name, bstmt->as.var_decl.name, j);
+                if (!symtable_lookup(top, sname)) {
+                    Symbol *s = symtable_insert(top, sname,
+                                                 bstmt->as.var_decl.type, SYM_GLOBAL);
+                    s->offset = cg->next_var_addr++;
+                }
+                bstmt->as.var_decl.static_offset = symtable_lookup(top, sname)->offset;
+            }
+            free(statics);
+        }
+    }
+
+    /* Pre-pass: walk AST for string literals, pre-allocate RAM slots */
+    { void walk_str(ASTNode *n) {
+        if (!n) return;
+        if (n->kind == AST_STRING_LIT) {
+            int slen = strlen(n->as.str_val);
+            int off = cg->next_var_addr; cg->next_var_addr += slen + 1;
+            int idx = add_string(cg, n->as.str_val, slen);
+            cg->strings[idx].addr = off;
+            return;
+        }
+        if (n->kind == AST_BLOCK) for (int i = 0; i < n->as.block.count; i++) walk_str(n->as.block.stmts[i]);
+        else if (n->kind == AST_BINARY) { walk_str(n->as.binary.left); walk_str(n->as.binary.right); }
+        else if (n->kind == AST_UNARY || n->kind == AST_DEREF || n->kind == AST_ADDR || n->kind == AST_CAST ||
+            n->kind == AST_PREINC || n->kind == AST_PREDEC || n->kind == AST_POSTINC || n->kind == AST_POSTDEC)
+            walk_str(n->as.unary.expr);
+        else if (n->kind == AST_ASSIGN) { walk_str(n->as.assign.lvalue); walk_str(n->as.assign.rvalue); }
+        else if (n->kind == AST_CALL) { for (int i = 0; i < n->as.call.arg_count; i++) walk_str(n->as.call.args[i]); }
+        else if (n->kind == AST_INDEX) { walk_str(n->as.index.base); walk_str(n->as.index.index); }
+        else if (n->kind == AST_MEMBER) walk_str(n->as.member.obj);
+        else if (n->kind == AST_TERNARY) { walk_str(n->as.if_.cond); walk_str(n->as.if_.then_body); walk_str(n->as.if_.else_body); }
+        else if (n->kind == AST_IF) { walk_str(n->as.if_.cond); walk_str(n->as.if_.then_body); walk_str(n->as.if_.else_body); }
+        else if (n->kind == AST_WHILE) { walk_str(n->as.while_.cond); walk_str(n->as.while_.body); }
+        else if (n->kind == AST_FOR) { walk_str(n->as.for_.init); walk_str(n->as.for_.cond); walk_str(n->as.for_.inc); walk_str(n->as.for_.body); }
+        else if (n->kind == AST_DO_WHILE) { walk_str(n->as.do_while.cond); walk_str(n->as.do_while.body); }
+        else if (n->kind == AST_RETURN) walk_str(n->as.ret.expr);
+        else if (n->kind == AST_VAR_DECL) walk_str(n->as.var_decl.init);
+        else if (n->kind == AST_FUNC_DECL) walk_str(n->as.func_decl.body);
+        else if (n->kind == AST_SWITCH) { walk_str(n->as.switch_.expr); walk_str(n->as.switch_.body); }
+        else if (n->kind == AST_CASE) walk_str(n->as.case_.body);
+        else if (n->kind == AST_LABEL) walk_str(n->as.label.stmt);
+    } walk_str(node); }
+
+    /* Emit _start: push fs; >r; push fs; >r; call __init; call main; halt */
     add_label(cg, "_start");
-    int saved_var_addr = cg->next_var_addr;
-    cg->next_var_addr = 0;
-    emit_push_frame_size(cg);   /* push 0; >r */
-    cg->next_var_addr = saved_var_addr;
-    int call_pos = cg->code_len;
+    int start_fs_pos = cg->code_len;
+    emit_push(cg, 0);           /* placeholder fs #1 */
+    emit_op(cg, OP_GT_R);
+    int start_fs_pos2 = cg->code_len;
+    emit_push(cg, 0);           /* placeholder fs #2 */
+    emit_op(cg, OP_GT_R);
+    int call_init_pos = cg->code_len;
     emit_op(cg, OP_CALL);
-    add_fixup(cg, call_pos, "main");
+    add_fixup(cg, call_init_pos, "__init");
+    emit_u32(cg, 0);
+    int call_main_pos = cg->code_len;
+    emit_op(cg, OP_CALL);
+    add_fixup(cg, call_main_pos, "main");
     emit_u32(cg, 0);
     emit_op(cg, OP_HALT);
 
-    /* Codegen all functions and global variables */
+    /* Emit __init: initialize all global variables and static locals */
+    add_label(cg, "__init");
+    for (int i = 0; i < node->as.block.count; i++) {
+        ASTNode *d = node->as.block.stmts[i];
+        if (d && d->kind == AST_VAR_DECL) {
+            Symbol *s = symtable_lookup(top, d->as.var_decl.name);
+            if (s && d->as.var_decl.init) {
+                codegen_expr(cg, d->as.var_decl.init, top);
+                emit_push(cg, (uint32_t)sym_addr(s));
+                emit_op(cg, OP_STORE);
+            }
+        }
+        /* Initialize static locals inside function bodies */
+        if (d && d->kind == AST_FUNC_DECL && d->as.func_decl.body) {
+            ASTNode **statics = NULL;
+            int scount = 0, scap = 0;
+            collect_static_locals(d->as.func_decl.body, &statics, &scount, &scap);
+            for (int j = 0; j < scount; j++) {
+                ASTNode *bstmt = statics[j];
+                char sname[256];
+                snprintf(sname, sizeof(sname), "__s_%s_%s_%d",
+                         d->as.func_decl.name, bstmt->as.var_decl.name, j);
+                Symbol *s = symtable_lookup(top, sname);
+                if (s && bstmt->as.var_decl.init) {
+                    codegen_expr(cg, bstmt->as.var_decl.init, top);
+                    emit_push(cg, (uint32_t)sym_addr(s));
+                    emit_op(cg, OP_STORE);
+                }
+            }
+            free(statics);
+        }
+    }
+    /* Initialize string literals (hidden __str_N globals) */
+    for (int i = 0; i < cg->string_count; i++) {
+        int str_offset = cg->strings[i].addr;
+        int slen = cg->strings[i].len;
+        for (int j = 0; j <= slen; j++) {
+            emit_push(cg, (uint32_t)(unsigned char)cg->strings[i].str[j]);
+            emit_push(cg, (uint32_t)(str_offset + j));
+            emit_op(cg, OP_STORE);
+        }
+    }
+    emit_op(cg, OP_RETURN);
+
+    /* Emit all functions */
     for (int i = 0; i < node->as.block.count; i++) {
         ASTNode *d = node->as.block.stmts[i];
         if (d && d->kind == AST_FUNC_DECL) {
             Type *fty = type_func(d->as.func_decl.return_type, NULL, d->as.func_decl.param_count, false);
             symtable_insert(top, d->as.func_decl.name, fty, SYM_FUNC);
             codegen_func(cg, d, top);
-        } else if (d && d->kind == AST_VAR_DECL) {
-            Symbol *s = symtable_insert(top, d->as.var_decl.name,
-                                         d->as.var_decl.type, SYM_GLOBAL);
-            s->offset = cg->next_var_addr++;
-            if (d->as.var_decl.init) {
-                codegen_expr(cg, d->as.var_decl.init, top);
-            } else {
-                emit_push(cg, 0);
-            }
-            emit_local_set(cg, sym_addr(s));
         }
     }
 
@@ -1259,8 +2046,17 @@ void codegen_program(Codegen *cg, ASTNode *node, FILE *out) {
     /* Optimize */
     peephole_optimize(cg);
 
+    /* Patch both _start frame_size placeholders to total binary size */
+    int total = cg->code_len + cg->data_end;
+    patch_jump(cg, start_fs_pos, total);
+    patch_jump(cg, start_fs_pos2, total);
+
     /* Write binary */
     fwrite(cg->code, 1, cg->code_len, out);
+    /* Write string data after the code */
+    for (int i = 0; i < cg->string_count; i++) {
+        fwrite(cg->strings[i].str, 1, cg->strings[i].len + 1, out); /* +1 for null */
+    }
 
     symtable_free(top);
 }
@@ -1341,27 +2137,91 @@ void codegen_program_object(Codegen *cg, ASTNode *node, FILE *out) {
 
     SymTable *top = symtable_new(NULL);
 
-    /* First pass: initialize all global variables */
+    /* Allocate global variable slots and static locals (create symbols) */
+    for (int i = 0; i < node->as.block.count; i++) {
+        ASTNode *d = node->as.block.stmts[i];
+        if (d && d->kind == AST_VAR_DECL) {
+            if (!symtable_lookup(top, d->as.var_decl.name)) {
+                Symbol *s = symtable_insert(top, d->as.var_decl.name,
+                                             d->as.var_decl.type, SYM_GLOBAL);
+                s->offset = cg->next_var_addr;
+                int slots = 1;
+                if (d->as.var_decl.type && d->as.var_decl.type->kind == TYPE_ARRAY &&
+                    d->as.var_decl.type->base->size == 1)
+                    slots = d->as.var_decl.type->size;
+                else {
+                    slots = type_sizeof(d->as.var_decl.type) / 4;
+                    if (slots < 1) slots = 1;
+                }
+                cg->next_var_addr += slots;
+            }
+        }
+        if (d && d->kind == AST_FUNC_DECL && d->as.func_decl.body) {
+            ASTNode **statics = NULL;
+            int scount = 0, scap = 0;
+            collect_static_locals(d->as.func_decl.body, &statics, &scount, &scap);
+            for (int j = 0; j < scount; j++) {
+                ASTNode *bstmt = statics[j];
+                char sname[256];
+                snprintf(sname, sizeof(sname), "__s_%s_%s_%d",
+                         d->as.func_decl.name, bstmt->as.var_decl.name, j);
+                if (!symtable_lookup(top, sname)) {
+                    Symbol *s = symtable_insert(top, sname,
+                                                 bstmt->as.var_decl.type, SYM_GLOBAL);
+                    s->offset = cg->next_var_addr++;
+                }
+                bstmt->as.var_decl.static_offset = symtable_lookup(top, sname)->offset;
+            }
+            free(statics);
+        }
+    }
+
+    /* Emit init code inline: initialize all global variables and static locals.
+     * Uses absolute addressing (push+store) compatible across translation units. */
     for (int i = 0; i < node->as.block.count; i++) {
         ASTNode *d = node->as.block.stmts[i];
         if (d && d->kind == AST_VAR_DECL) {
             Symbol *s = symtable_lookup(top, d->as.var_decl.name);
-            if (!s) {
-                s = symtable_insert(top, d->as.var_decl.name,
-                                     d->as.var_decl.type, SYM_GLOBAL);
-                s->offset = cg->next_var_addr++;
-            }
-            if (d->as.var_decl.init) {
+            if (s && d->as.var_decl.init) {
                 codegen_expr(cg, d->as.var_decl.init, top);
+                emit_push(cg, (uint32_t)sym_addr(s));
+                emit_op(cg, OP_STORE);
             }
-            emit_local_set(cg, sym_addr(s));
+        }
+        if (d && d->kind == AST_FUNC_DECL && d->as.func_decl.body) {
+            ASTNode **statics = NULL;
+            int scount = 0, scap = 0;
+            collect_static_locals(d->as.func_decl.body, &statics, &scount, &scap);
+            for (int j = 0; j < scount; j++) {
+                ASTNode *bstmt = statics[j];
+                char sname[256];
+                snprintf(sname, sizeof(sname), "__s_%s_%s_%d",
+                         d->as.func_decl.name, bstmt->as.var_decl.name, j);
+                Symbol *s = symtable_lookup(top, sname);
+                if (s && bstmt->as.var_decl.init) {
+                    codegen_expr(cg, bstmt->as.var_decl.init, top);
+                    emit_push(cg, (uint32_t)sym_addr(s));
+                    emit_op(cg, OP_STORE);
+                }
+            }
+            free(statics);
+        }
+    }
+    /* Initialize string literals */
+    for (int i = 0; i < cg->string_count; i++) {
+        int str_offset = cg->strings[i].addr;
+        int slen = cg->strings[i].len;
+        for (int j = 0; j <= slen; j++) {
+            emit_push(cg, (uint32_t)(unsigned char)cg->strings[i].str[j]);
+            emit_push(cg, (uint32_t)(str_offset + j));
+            emit_op(cg, OP_STORE);
         }
     }
 
-    /* Second pass: codegen all functions */
+    /* Codegen all functions */
     for (int i = 0; i < node->as.block.count; i++) {
         ASTNode *d = node->as.block.stmts[i];
-        if (d && d->kind == AST_FUNC_DECL) {
+        if (d && d->kind == AST_FUNC_DECL && d->as.func_decl.body) {
             Type *fty = type_func(d->as.func_decl.return_type, NULL,
                                   d->as.func_decl.param_count, false);
             symtable_insert(top, d->as.func_decl.name, fty, SYM_FUNC);
@@ -1370,21 +2230,49 @@ void codegen_program_object(Codegen *cg, ASTNode *node, FILE *out) {
     }
     emit_op(cg, OP_HALT);
 
-    /* Classify labels: non-".L" and non-"_start" → global symbols */
+    /* Track static function names to exclude from global symbols */
+    int static_func_count = 0;
+    int static_func_cap = 16;
+    const char **static_func_names = malloc(sizeof(char*) * static_func_cap);
+    for (int i = 0; i < node->as.block.count; i++) {
+        ASTNode *d = node->as.block.stmts[i];
+        if (d && d->kind == AST_FUNC_DECL && d->as.func_decl.is_static) {
+            if (static_func_count >= static_func_cap) {
+                static_func_cap *= 2;
+                static_func_names = realloc(static_func_names, sizeof(char*) * static_func_cap);
+            }
+            static_func_names[static_func_count++] = d->as.func_decl.name;
+        }
+    }
+
+    /* Classify labels: non-".L", non-"_start", non-static → global symbols */
     int *global_label_ids = malloc(sizeof(int) * cg->label_count);
     int global_label_count = 0;
     for (int i = 0; i < cg->label_count; i++) {
         if (cg->labels[i].name[0] != '.' &&
-            strcmp(cg->labels[i].name, "_start") != 0) {
-            global_label_ids[global_label_count++] = i;
+            strcmp(cg->labels[i].name, "_start") != 0 &&
+            strcmp(cg->labels[i].name, "__init") != 0) {
+            /* Check if it's a static function */
+            bool is_static = false;
+            for (int j = 0; j < static_func_count; j++) {
+                if (strcmp(cg->labels[i].name, static_func_names[j]) == 0) {
+                    is_static = true;
+                    break;
+                }
+            }
+            if (!is_static) {
+                global_label_ids[global_label_count++] = i;
+            }
         }
     }
+    free(static_func_names);
 
     /* Classify fixups: external ones target labels NOT in labels[] */
     int *ext_fixup_ids = malloc(sizeof(int) * cg->fixup_count);
     int *ext_sym_ids = malloc(sizeof(int) * cg->fixup_count);
     int ext_fixup_count = 0;
     for (int i = 0; i < cg->fixup_count; i++) {
+        if (cg->fixups[i].label == NULL) continue; /* resolved locally */
         int addr = find_label(cg, cg->fixups[i].label);
         if (addr < 0) {
             bool dup = false;
@@ -1440,18 +2328,23 @@ void codegen_program_object(Codegen *cg, ASTNode *node, FILE *out) {
         s->st_shndx = SHN_UNDEF;
     }
 
-    /* Build .rela.text */
-    int rela_count = cg->fixup_count;
+    /* Build .rela.text - only for unresolved (external) fixups */
+    int rela_count = 0;
+    for (int i = 0; i < cg->fixup_count; i++) {
+        if (cg->fixups[i].label != NULL) rela_count++;
+    }
     int rela_entsize = sizeof(Elf32_Rela);
     int rela_size = rela_count * rela_entsize;
     uint8_t *rela = malloc(rela_size > 0 ? rela_size : 1);
     memset(rela, 0, rela_size > 0 ? rela_size : 1);
+    int rela_idx = 0;
 
     for (int i = 0; i < cg->fixup_count; i++) {
-        Elf32_Rela *r = (Elf32_Rela*)(rela + i * rela_entsize);
+        if (cg->fixups[i].label == NULL) continue; /* already resolved */
+        Elf32_Rela *r = (Elf32_Rela*)(rela + rela_idx * rela_entsize);
         int addr = find_label(cg, cg->fixups[i].label);
         if (addr >= 0) {
-            /* Internal reference - resolve in place, still emit rela */
+            /* Internal reference - find in global symtab */
             int sym_idx = -1;
             for (int j = 0; j < global_label_count; j++) {
                 if (strcmp(cg->labels[global_label_ids[j]].name,
@@ -1463,13 +2356,7 @@ void codegen_program_object(Codegen *cg, ASTNode *node, FILE *out) {
             if (sym_idx >= 0) {
                 r->r_offset = (uint32_t)(cg->fixups[i].code_pos + 1);
                 r->r_info = ELF32_R_INFO(sym_idx, R_WASM32_32);
-                r->r_addend = (int32_t)addr;
-                /* Patch in code array too */
-                int fpos = cg->fixups[i].code_pos;
-                cg->code[fpos + 1] = addr & 0xFF;
-                cg->code[fpos + 2] = (addr >> 8) & 0xFF;
-                cg->code[fpos + 3] = (addr >> 16) & 0xFF;
-                cg->code[fpos + 4] = (addr >> 24) & 0xFF;
+                r->r_addend = 0;
             }
         } else {
             /* External reference - look up symbol index */
@@ -1487,6 +2374,7 @@ void codegen_program_object(Codegen *cg, ASTNode *node, FILE *out) {
                 r->r_addend = 0;
             }
         }
+        rela_idx++;
     }
 
     /* Build .shstrtab */

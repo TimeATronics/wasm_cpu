@@ -63,6 +63,7 @@ struct ASTNode {
         char char_val;
         char *str_val;
         double double_val;
+        int64_t long_val;
         char *ident;
         /* Binary: op left right */
         struct { int op; ASTNode *left, *right; } binary;
@@ -91,7 +92,7 @@ struct ASTNode {
         /* DoWhile */
         struct { ASTNode *body; ASTNode *cond; char *brk_label; char *cont_label; char *loop_top_label; } do_while;
         /* VarDecl: name, type, init */
-        struct { char *name; Type *type; ASTNode *init; } var_decl;
+        struct { char *name; Type *type; ASTNode *init; bool is_static; bool is_extern; int static_offset; } var_decl;
         /* Label: name, stmt */
         struct { char *name; ASTNode *stmt; } label;
         /* Goto: target label name */
@@ -99,7 +100,7 @@ struct ASTNode {
         /* Break/Continue: jump target label */
         struct { char *label; } jump_label;
         /* FuncDecl: name, return_type, params, param_count, body */
-        struct { char *name; Type *return_type; ASTNode **params; int param_count; ASTNode *body; } func_decl;
+        struct { char *name; Type *return_type; ASTNode **params; int param_count; ASTNode *body; bool is_static; } func_decl;
         /* Switch */
         struct {
             ASTNode *expr;

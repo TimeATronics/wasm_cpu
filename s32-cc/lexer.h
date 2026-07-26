@@ -3,6 +3,7 @@
 
 #include <stdio.h>
 #include <stdbool.h>
+#include <stdint.h>
 
 typedef enum {
     /* Literals */
@@ -13,7 +14,7 @@ typedef enum {
     TOK_BREAK, TOK_CONTINUE, TOK_GOTO, TOK_SIZEOF, TOK_NULL,
     TOK_UNSIGNED, TOK_SIGNED, TOK_LONG, TOK_SHORT,
     TOK_ENUM, TOK_STRUCT, TOK_UNION,
-    TOK_TYPEDEF, TOK_STATIC, TOK_EXTERN, TOK_CONST,
+    TOK_TYPEDEF, TOK_STATIC, TOK_EXTERN, TOK_CONST, TOK_VOLATILE,
     TOK_DOUBLE, TOK_FLOAT,
     /* Operators */
     TOK_PLUS, TOK_MINUS, TOK_STAR, TOK_SLASH, TOK_PERCENT,
@@ -36,11 +37,13 @@ typedef enum {
 typedef struct {
     TokenKind kind;
     int line, col;
+    bool is_long_lit;
     union {
         int int_val;
         char char_val;
         char *str_val;
         double double_val;
+        int64_t long_val;
     } val;
 } Token;
 

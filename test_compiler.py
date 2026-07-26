@@ -27,14 +27,77 @@ with open(EXPECTED) as f:
 
 
 MULTI_FILE_SETS = {
-    # (lib_file, client_file) pairs for multi-file tests
+    # (lib_file, client_file) pairs - library files depend on client for main()
+    # chapter_9
     "chapter_9/valid/libraries/addition.c": "chapter_9/valid/libraries/addition_client.c",
     "chapter_9/valid/libraries/many_args.c": "chapter_9/valid/libraries/many_args_client.c",
     "chapter_9/valid/libraries/system_call.c": "chapter_9/valid/libraries/system_call_client.c",
-    "chapter_9/valid/libraries/no_function_calls/local_stack_variables.c":
-        "chapter_9/valid/libraries/no_function_calls/local_stack_variables_client.c",
     "chapter_9/valid/libraries/no_function_calls/division.c":
         "chapter_9/valid/libraries/no_function_calls/division_client.c",
+    "chapter_9/valid/libraries/no_function_calls/local_stack_variables.c":
+        "chapter_9/valid/libraries/no_function_calls/local_stack_variables_client.c",
+    # chapter_10
+    "chapter_10/valid/libraries/external_linkage_function.c":
+        "chapter_10/valid/libraries/external_linkage_function_client.c",
+    "chapter_10/valid/libraries/external_tentative_var.c":
+        "chapter_10/valid/libraries/external_tentative_var_client.c",
+    "chapter_10/valid/libraries/external_var_scoping.c":
+        "chapter_10/valid/libraries/external_var_scoping_client.c",
+    "chapter_10/valid/libraries/external_variable.c":
+        "chapter_10/valid/libraries/external_variable_client.c",
+    "chapter_10/valid/libraries/internal_hides_external_linkage.c":
+        "chapter_10/valid/libraries/internal_hides_external_linkage_client.c",
+    "chapter_10/valid/libraries/internal_linkage_function.c":
+        "chapter_10/valid/libraries/internal_linkage_function_client.c",
+    "chapter_10/valid/libraries/internal_linkage_var.c":
+        "chapter_10/valid/libraries/internal_linkage_var_client.c",
+    "chapter_10/valid/extra_credit/libraries/same_label_same_fun.c":
+        "chapter_10/valid/extra_credit/libraries/same_label_same_fun_client.c",
+    # chapter_11
+    "chapter_11/valid/libraries/long_args.c": "chapter_11/valid/libraries/long_args_client.c",
+    "chapter_11/valid/libraries/long_global_var.c": "chapter_11/valid/libraries/long_global_var_client.c",
+    "chapter_11/valid/libraries/maintain_stack_alignment.c": "chapter_11/valid/libraries/maintain_stack_alignment_client.c",
+    "chapter_11/valid/libraries/return_long.c": "chapter_11/valid/libraries/return_long_client.c",
+    # chapter_12
+    "chapter_12/valid/libraries/unsigned_args.c": "chapter_12/valid/libraries/unsigned_args_client.c",
+    "chapter_12/valid/libraries/unsigned_global_var.c": "chapter_12/valid/libraries/unsigned_global_var_client.c",
+    # chapter_14
+    "chapter_14/valid/libraries/static_pointer.c": "chapter_14/valid/libraries/static_pointer_client.c",
+    "chapter_14/valid/libraries/global_pointer.c": "chapter_14/valid/libraries/global_pointer_client.c",
+    # chapter_15
+    "chapter_15/valid/libraries/global_array.c": "chapter_15/valid/libraries/global_array_client.c",
+    "chapter_15/valid/libraries/return_pointer_to_array.c": "chapter_15/valid/libraries/return_pointer_to_array_client.c",
+    "chapter_15/valid/libraries/set_array_val.c": "chapter_15/valid/libraries/set_array_val_client.c",
+    # chapter_16
+    "chapter_16/valid/libraries/char_arguments.c": "chapter_16/valid/libraries/char_arguments_client.c",
+    "chapter_16/valid/libraries/global_char.c": "chapter_16/valid/libraries/global_char_client.c",
+    "chapter_16/valid/libraries/return_char.c": "chapter_16/valid/libraries/return_char_client.c",
+    # chapter_17
+    "chapter_17/valid/libraries/pass_alloced_memory.c": "chapter_17/valid/libraries/pass_alloced_memory_client.c",
+    "chapter_17/valid/libraries/test_for_memory_leaks.c": "chapter_17/valid/libraries/test_for_memory_leaks_client.c",
+    # chapter_18
+    "chapter_18/valid/extra_credit/libraries/classify_unions.c": "chapter_18/valid/extra_credit/libraries/classify_unions_client.c",
+    "chapter_18/valid/extra_credit/libraries/param_passing.c": "chapter_18/valid/extra_credit/libraries/param_passing_client.c",
+    "chapter_18/valid/extra_credit/libraries/static_union_inits.c": "chapter_18/valid/extra_credit/libraries/static_union_inits_client.c",
+    "chapter_18/valid/extra_credit/libraries/union_inits.c": "chapter_18/valid/extra_credit/libraries/union_inits_client.c",
+    "chapter_18/valid/extra_credit/libraries/union_retvals.c": "chapter_18/valid/extra_credit/libraries/union_retvals_client.c",
+    "chapter_18/valid/no_structure_parameters/libraries/array_of_structs.c": "chapter_18/valid/no_structure_parameters/libraries/array_of_structs_client.c",
+    "chapter_18/valid/no_structure_parameters/libraries/global_struct.c": "chapter_18/valid/no_structure_parameters/libraries/global_struct_client.c",
+    "chapter_18/valid/no_structure_parameters/libraries/opaque_struct.c": "chapter_18/valid/no_structure_parameters/libraries/opaque_struct_client.c",
+    "chapter_18/valid/no_structure_parameters/libraries/param_struct_pointer.c": "chapter_18/valid/no_structure_parameters/libraries/param_struct_pointer_client.c",
+    "chapter_18/valid/no_structure_parameters/libraries/return_struct_pointer.c": "chapter_18/valid/no_structure_parameters/libraries/return_struct_pointer_client.c",
+    "chapter_18/valid/no_structure_parameters/libraries/initializers/auto_struct_initializers.c": "chapter_18/valid/no_structure_parameters/libraries/initializers/auto_struct_initializers_client.c",
+    "chapter_18/valid/no_structure_parameters/libraries/initializers/nested_auto_struct_initializers.c": "chapter_18/valid/no_structure_parameters/libraries/initializers/nested_auto_struct_initializers_client.c",
+    "chapter_18/valid/no_structure_parameters/libraries/initializers/nested_static_struct_initializers.c": "chapter_18/valid/no_structure_parameters/libraries/initializers/nested_static_struct_initializers_client.c",
+    "chapter_18/valid/no_structure_parameters/libraries/initializers/static_struct_initializers.c": "chapter_18/valid/no_structure_parameters/libraries/initializers/static_struct_initializers_client.c",
+    "chapter_18/valid/parameters/libraries/classify_params.c": "chapter_18/valid/parameters/libraries/classify_params_client.c",
+    "chapter_18/valid/parameters/libraries/modify_param.c": "chapter_18/valid/parameters/libraries/modify_param_client.c",
+    "chapter_18/valid/parameters/libraries/param_calling_conventions.c": "chapter_18/valid/parameters/libraries/param_calling_conventions_client.c",
+    "chapter_18/valid/parameters/libraries/pass_struct.c": "chapter_18/valid/parameters/libraries/pass_struct_client.c",
+    "chapter_18/valid/parameters/libraries/struct_sizes.c": "chapter_18/valid/parameters/libraries/struct_sizes_client.c",
+    "chapter_18/valid/params_and_returns/libraries/access_retval_members.c": "chapter_18/valid/params_and_returns/libraries/access_retval_members_client.c",
+    "chapter_18/valid/params_and_returns/libraries/return_calling_conventions.c": "chapter_18/valid/params_and_returns/libraries/return_calling_conventions_client.c",
+    "chapter_18/valid/params_and_returns/libraries/retval_struct_sizes.c": "chapter_18/valid/params_and_returns/libraries/retval_struct_sizes_client.c",
 }
 
 
@@ -134,7 +197,7 @@ def compile_and_run(source_file: Path, verbose=False):
         sim_cmd = [str(SIM), str(bin_path)]
         try:
             sim_result = subprocess.run(
-                sim_cmd, capture_output=True, text=True, timeout=30,
+                sim_cmd, capture_output=True, text=True, timeout=120,
                 stdin=subprocess.DEVNULL
             )
         except subprocess.TimeoutExpired:

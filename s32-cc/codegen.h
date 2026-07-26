@@ -59,6 +59,7 @@ enum {
     OP_FADD      = 0x41, OP_FSUB = 0x42, OP_FMUL = 0x43,
     OP_FDIV      = 0x44, OP_FCMP = 0x45, OP_F2I  = 0x46,
     OP_I2F       = 0x47,
+    OP_CALL_IND  = 0x48, /* indirect call: pop target, rpush(pc), pc = target */
     OP_HALT      = 0xFF,
 };
 
@@ -88,6 +89,8 @@ typedef struct {
 
     /* Current function's frame size (for CALL prologue) */
     int current_frame_size;
+
+    Type *current_return_type;
 
     FILE *out;
 } Codegen;

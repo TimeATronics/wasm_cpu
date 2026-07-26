@@ -217,6 +217,9 @@ ASTNode *ast_var_decl(char *name, Type *type, ASTNode *init, int line, int col) 
     n->as.var_decl.name = name;
     n->as.var_decl.type = type;
     n->as.var_decl.init = init;
+    n->as.var_decl.is_static = false;
+    n->as.var_decl.is_extern = false;
+    n->as.var_decl.static_offset = -1;
     return n;
 }
 
@@ -227,6 +230,7 @@ ASTNode *ast_func_decl(char *name, Type *ret, ASTNode **params, int param_count,
     n->as.func_decl.params = params;
     n->as.func_decl.param_count = param_count;
     n->as.func_decl.body = body;
+    n->as.func_decl.is_static = false;
     return n;
 }
 
