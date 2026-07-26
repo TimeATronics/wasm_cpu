@@ -3,6 +3,35 @@
 #include <string.h>
 #include <ctype.h>
 
+/* -- Macro table for #define ------------------------------------- */
+
+typedef struct Macro {
+    char *name;
+    char *value;
+    struct Macro *next;
+} Macro;
+
+static Macro *macro_list = NULL;
+
+static void macro_add(const char *name, const char *value) {
+    for (Macro *m = macro_list; m; m = m->next) {
+        if (strcmp(m->name, name) == 0) { free(m->value); m->value = strdup(value); return; }
+    }
+    Macro *m = malloc(sizeof(Macro));
+    m->name = strdup(name);
+    m->value = strdup(value);
+    m->next = macro_list;
+    macro_list = m;
+}
+
+static const char *macro_get(const char *name) {
+    for (Macro *m = macro_list; m; m = m->next)
+        if (strcmp(m->name, name) == 0) return m->value;
+    return NULL;
+}
+
+/* -- Lexer state ------------------------------------------------- */
+
 void lexer_init(Lexer *lex, const char *filename, FILE *fp) {
     memset(lex, 0, sizeof(*lex));
     lex->fp = fp;
@@ -42,6 +71,44 @@ static char next_ch(Lexer *lex) {
     return c;
 }
 
+/* Process a #define directive. Returns true if it was handled. */
+static bool process_define(Lexer *lex) {
+    /* Read the rest of the line after #define */
+    /* Find start of macro name */
+    while (peek_ch(lex) && isspace((unsigned char)peek_ch(lex)) && peek_ch(lex) != '\n')
+        next_ch(lex);
+    
+    if (!isalpha((unsigned char)peek_ch(lex)) && peek_ch(lex) != '_')
+        return false; /* Not a valid macro name */
+    
+    /* Read macro name */
+    char name[256];
+    int ni = 0;
+    while (peek_ch(lex) && (isalnum((unsigned char)peek_ch(lex)) || peek_ch(lex) == '_')) {
+        name[ni++] = next_ch(lex);
+        if (ni >= 255) break;
+    }
+    name[ni] = 0;
+    
+    /* Skip whitespace before value */
+    while (peek_ch(lex) && isspace((unsigned char)peek_ch(lex)) && peek_ch(lex) != '\n')
+        next_ch(lex);
+    
+    /* Read rest of line as the value */
+    char value[4096];
+    int vi = 0;
+    while (peek_ch(lex) && peek_ch(lex) != '\n' && peek_ch(lex) != '\r') {
+        value[vi++] = next_ch(lex);
+        if (vi >= 4095) break;
+    }
+    /* Trim trailing whitespace from value */
+    while (vi > 0 && isspace((unsigned char)value[vi-1])) vi--;
+    value[vi] = 0;
+    
+    macro_add(name, value);
+    return true;
+}
+
 static void skip_whitespace_and_comments(Lexer *lex) {
     for (;;) {
         char c = peek_ch(lex);
@@ -66,7 +133,109 @@ static void skip_whitespace_and_comments(Lexer *lex) {
             }
         }
         if (c == '#' && lex->col == 1) {
-            /* Skip preprocessor lines for now */
+            next_ch(lex); /* consume '#' */
+            /* Skip whitespace after # */
+            while (peek_ch(lex) && isspace((unsigned char)peek_ch(lex)) && peek_ch(lex) != '\n')
+                next_ch(lex);
+            
+            if (peek_ch(lex) == 'd' && lex->buf_pos + 5 < lex->buf_len &&
+                memcmp(lex->buf + lex->buf_pos, "define", 6) == 0) {
+                /* Skip "define" */
+                for (int i = 0; i < 6; i++) next_ch(lex);
+                process_define(lex);
+                /* Skip rest of line */
+                while (peek_ch(lex) && peek_ch(lex) != '\n') next_ch(lex);
+                continue;
+            }
+            
+            if (peek_ch(lex) == 'i' && lex->buf_pos + 6 < lex->buf_len &&
+                memcmp(lex->buf + lex->buf_pos, "include", 7) == 0) {
+                /* Skip 'include' */
+                for (int i = 0; i < 7; i++) next_ch(lex);
+                /* Skip whitespace */
+                while (peek_ch(lex) && isspace((unsigned char)peek_ch(lex)) && peek_ch(lex) != '\n')
+                    next_ch(lex);
+                
+                char delim = peek_ch(lex);
+                if (delim == '"' || delim == '<') {
+                    char end_delim = (delim == '"') ? '"' : '>';
+                    next_ch(lex); /* skip opening delim */
+                    
+                    char fname[512]; int fi = 0;
+                    while (peek_ch(lex) && peek_ch(lex) != end_delim && peek_ch(lex) != '\n') {
+                        fname[fi++] = next_ch(lex);
+                    }
+                    fname[fi] = 0;
+                    if (peek_ch(lex) == end_delim) next_ch(lex);
+                    
+                    /* Try to open and include the file */
+                    char path[1024];
+                    FILE *inc = NULL;
+                    if (delim == '"') {
+                        /* Try relative to source file directory */
+                        const char *slash = strrchr(lex->filename, '/');
+                        if (!slash) slash = strrchr(lex->filename, '\\');
+                        if (slash) {
+                            int dlen = (int)(slash - lex->filename);
+                            memcpy(path, lex->filename, dlen);
+                            snprintf(path + dlen, sizeof(path) - dlen, "/%s", fname);
+                        } else {
+                            snprintf(path, sizeof(path), "%s", fname);
+                        }
+                        inc = fopen(path, "r");
+                    }
+                    if (!inc) inc = fopen(fname, "r");
+                    
+                    if (inc) {
+                        /* Save current lexer state */
+                        char *old_buf = lex->buf;
+                        size_t old_len = lex->buf_len;
+                        size_t old_pos = lex->buf_pos;
+                        int old_line = lex->line;
+                        int old_col = lex->col;
+                        
+                        /* Read the included file, strip \r */
+                        fseek(inc, 0, SEEK_END);
+                        long sz = ftell(inc);
+                        fseek(inc, 0, SEEK_SET);
+                        char *new_buf = malloc(sz + 1);
+                        fread(new_buf, 1, sz, inc);
+                        new_buf[sz] = 0;
+                        fclose(inc);
+                        
+                        /* Strip \r from included content */
+                        int clean_len = 0;
+                        for (long i = 0; i < sz; i++)
+                            if (new_buf[i] != '\r') new_buf[clean_len++] = new_buf[i];
+                        new_buf[clean_len] = 0;
+                        
+                        /* Concatenate included content + rest of current file */
+                        size_t rest_len = old_len - old_pos;
+                        char *combined = malloc(clean_len + 1 + rest_len + 1);
+                        memcpy(combined, new_buf, clean_len);
+                        combined[clean_len] = '\n'; /* separator */
+                        memcpy(combined + clean_len + 1, old_buf + old_pos, rest_len);
+                        combined[clean_len + 1 + rest_len] = 0;
+                        
+                        free(new_buf);
+                        
+                        /* Replace buffer and reset position */
+                        lex->buf = combined;
+                        lex->buf_len = clean_len + 1 + rest_len;
+                        lex->buf_pos = 0;
+                        lex->line = 1;
+                        lex->col = 1;
+                        
+                        free(old_buf);
+                        continue;
+                    }
+                }
+                /* Skip rest of line if include failed */
+                while (peek_ch(lex) && peek_ch(lex) != '\n') next_ch(lex);
+                continue;
+            }
+            
+            /* Any other #directive: skip the line */
             while (peek_ch(lex) && peek_ch(lex) != '\n') next_ch(lex);
             continue;
         }
@@ -209,7 +378,6 @@ Token lexer_next(Lexer *lex) {
                 t.is_long_lit = true;
                 t.val.long_val = strtoll(buf, NULL, 10);
             } else {
-                t.is_long_lit = false;
                 t.val.int_val = (int)strtoul(buf, NULL, 10);
             }
             return t;
@@ -229,7 +397,7 @@ Token lexer_next(Lexer *lex) {
                 while (isdigit(peek_ch(lex)) && bi < 60)
                     buf[bi++] = next_ch(lex);
             }
-            buf[bi] = '\0';
+            buf[bi] = 0;
             double fval = strtod(buf, NULL);
             if (peek_ch(lex) == 'f' || peek_ch(lex) == 'F') next_ch(lex);
             if (peek_ch(lex) == 'l' || peek_ch(lex) == 'L') next_ch(lex);
@@ -241,12 +409,41 @@ Token lexer_next(Lexer *lex) {
 
     /* Identifier or keyword */
     if (isalpha(c) || c == '_') {
-        char *id = malloc(256);
+        char *id = malloc(64);
         int len = 0;
-        while (isalnum(peek_ch(lex)) || peek_ch(lex) == '_') {
+        do {
             id[len++] = next_ch(lex);
-        }
+        } while ((isalnum(peek_ch(lex)) || peek_ch(lex) == '_') && len < 60);
         id[len] = 0;
+
+        /* Check for macro expansion */
+        const char *macro_val = macro_get(id);
+        if (macro_val) {
+            /* Save current state, insert macro value, re-tokenize */
+            free(id);
+            
+            char *old_buf = lex->buf;
+            size_t old_len = lex->buf_len;
+            size_t old_pos = lex->buf_pos;
+            
+            int vlen = strlen(macro_val);
+            size_t rest_len = old_len - old_pos;
+            char *combined = malloc(vlen + 1 + rest_len + 1);
+            memcpy(combined, macro_val, vlen);
+            combined[vlen] = ' ';
+            memcpy(combined + vlen + 1, old_buf + old_pos, rest_len);
+            combined[vlen + 1 + rest_len] = 0;
+            
+            lex->buf = combined;
+            lex->buf_len = vlen + 1 + rest_len;
+            lex->buf_pos = 0;
+            /* Keep line/col - macro expansion doesn't change source location */
+            
+            free(old_buf);
+            /* Return the first token from the expanded buffer */
+            return lexer_next(lex);
+        }
+        
         TokenKind kind = TOK_IDENT;
         if (len == 3 && memcmp(id, "int", 3) == 0) kind = TOK_INT;
         else if (len == 4 && memcmp(id, "char", 4) == 0) kind = TOK_CHAR;
@@ -378,11 +575,56 @@ const char *token_name(TokenKind kind) {
         case TOK_STATIC: return "static";
         case TOK_EXTERN: return "extern";
         case TOK_CONST: return "const";
+        case TOK_VOLATILE: return "volatile";
         case TOK_DOUBLE: return "double";
         case TOK_FLOAT: return "float";
+        case TOK_STAR: return "'*'";
+        case TOK_PLUS: return "'+'";
+        case TOK_MINUS: return "'-'";
+        case TOK_SLASH: return "'/'";
+        case TOK_PERCENT: return "'%'";
+        case TOK_AMP: return "'&'";
+        case TOK_PIPE: return "'|'";
+        case TOK_CARET: return "'^'";
+        case TOK_TILDE: return "'~'";
+        case TOK_BANG: return "'!'";
+        case TOK_SHL: return "'<<'";
+        case TOK_SHR: return "'>>'";
+        case TOK_EQ: return "'=='";
+        case TOK_NEQ: return "'!='";
+        case TOK_LT: return "'<'";
+        case TOK_GT: return "'>'";
+        case TOK_LTE: return "'<='";
+        case TOK_GTE: return "'>='";
+        case TOK_LAND: return "'&&'";
+        case TOK_LOR: return "'||'";
+        case TOK_ASSIGN: return "'='";
+        case TOK_PLUS_EQ: return "'+='";
+        case TOK_MINUS_EQ: return "'-='";
+        case TOK_STAR_EQ: return "'*='";
+        case TOK_SLASH_EQ: return "'/='";
+        case TOK_PERCENT_EQ: return "'%='";
+        case TOK_AMP_EQ: return "'&='";
+        case TOK_PIPE_EQ: return "'|='";
+        case TOK_CARET_EQ: return "'^='";
+        case TOK_SHL_EQ: return "'<<='";
+        case TOK_SHR_EQ: return "'>>='";
+        case TOK_INC: return "'++'";
+        case TOK_DEC: return "'--'";
+        case TOK_ARROW: return "'->'";
+        case TOK_DOT: return "'.'";
+        case TOK_LPAREN: return "'('";
+        case TOK_RPAREN: return "')'";
+        case TOK_LBRACE: return "'{'";
+        case TOK_RBRACE: return "'}'";
+        case TOK_LBRACKET: return "'['";
+        case TOK_RBRACKET: return "']'";
+        case TOK_SEMICOLON: return "';'";
+        case TOK_COMMA: return "','";
+        case TOK_COLON: return "':'";
+        case TOK_QUESTION: return "'?'";
         case TOK_EOF: return "EOF";
         case TOK_ERROR: return "error";
-        case TOK_ELLIPSIS: return "...";
         default: return "token";
     }
 }
