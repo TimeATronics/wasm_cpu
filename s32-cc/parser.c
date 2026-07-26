@@ -503,7 +503,8 @@ static ASTNode *parse_primary(Parser *p) {
         if (nk == TOK_INT || nk == TOK_CHAR || nk == TOK_VOID ||
             nk == TOK_LONG || nk == TOK_SHORT ||
             nk == TOK_UNSIGNED || nk == TOK_SIGNED ||
-            nk == TOK_ENUM ||
+            nk == TOK_ENUM || nk == TOK_DOUBLE || nk == TOK_FLOAT ||
+            nk == TOK_STRUCT || nk == TOK_UNION ||
             (nk == TOK_IDENT && typedef_lookup(peek(p).val.str_val))) {
             Type *cty = parse_type(p);
             /* Handle abstract declarators in casts: (int(**)[2]), (int(*)(int)) */
@@ -515,6 +516,15 @@ static ASTNode *parse_primary(Parser *p) {
                     /* check for qualifiers like const - skip for now */
                     while (check(p, TOK_CONST) || check(p, TOK_VOLATILE)) consume(p);
                 } else if (check(p, TOK_LPAREN)) {
+                    /* Check if this is a nested cast like (int)(double)x */
+                    TokenKind nk = peek_next(p).kind;
+                    if (nk == TOK_INT || nk == TOK_CHAR || nk == TOK_VOID ||
+                        nk == TOK_LONG || nk == TOK_SHORT || 
+                        nk == TOK_UNSIGNED || nk == TOK_SIGNED ||
+                        nk == TOK_DOUBLE || nk == TOK_FLOAT ||
+                        nk == TOK_STRUCT || nk == TOK_UNION) {
+                        break; /* nested cast, let expression parser handle it */
+                    }
                     /* function params: (int, float) */
                     consume(p);
                     Type **param_types = NULL;
@@ -556,6 +566,14 @@ static ASTNode *parse_primary(Parser *p) {
                 n->type = cty;
                 return n;
             }
+            /* No closing paren - abstract declarator broke (nested cast).
+             * The rest is the expression operand. */
+            ASTNode *operand = parse_expr_with_bp(p, 14);
+            ASTNode *n = ast_new(AST_CAST, t.line, t.col);
+            n->as.unary.expr = operand;
+            n->as.unary.op = TOK_INT;
+            n->type = cty;
+            return n;
         }
         ASTNode *e = parse_expr(p);
         expect(p, TOK_RPAREN);
