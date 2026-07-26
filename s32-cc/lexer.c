@@ -476,6 +476,7 @@ Token lexer_next(Lexer *lex) {
         else if (len == 8 && memcmp(id, "volatile", 8) == 0) kind = TOK_VOLATILE;
         else if (len == 6 && memcmp(id, "double", 6) == 0) kind = TOK_DOUBLE;
         else if (len == 5 && memcmp(id, "float", 5) == 0) kind = TOK_FLOAT;
+        else if (len == 3 && memcmp(id, "asm", 3) == 0) kind = TOK_ASM;
         if (kind != TOK_IDENT) { free(id); }
         Token t = make_token(kind, sl, sc);
         if (kind == TOK_IDENT || kind == TOK_NULL) t.val.str_val = id;

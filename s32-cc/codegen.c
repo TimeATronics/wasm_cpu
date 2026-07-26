@@ -1692,6 +1692,24 @@ static void codegen_stmt(Codegen *cg, ASTNode *node, SymTable *st) {
         break;
     }
 
+    case AST_ASM: {
+        /* Inline assembly: parse hex bytes from string and emit */
+        if (node->as.unary.expr && node->as.unary.expr->kind == AST_STRING_LIT) {
+            const char *s = node->as.unary.expr->as.str_val;
+            int val = 0, count = 0;
+            for (const char *p = s; *p; p++) {
+                if (*p >= '0' && *p <= '9') val = (val << 4) | (*p - '0');
+                else if (*p >= 'a' && *p <= 'f') val = (val << 4) | (*p - 'a' + 10);
+                else if (*p >= 'A' && *p <= 'F') val = (val << 4) | (*p - 'A' + 10);
+                else { if (count) { emit(cg, (uint8_t)val); val = 0; count = 0; } continue; }
+                count++;
+                if (count == 2) { emit(cg, (uint8_t)val); val = 0; count = 0; }
+            }
+            if (count) emit(cg, (uint8_t)val);
+        }
+        break;
+    }
+
     default:
         /* Expression as statement */
         codegen_expr(cg, node, st);

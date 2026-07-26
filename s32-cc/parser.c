@@ -1003,6 +1003,19 @@ static ASTNode *parse_stmt(Parser *p) {
         }
     }
 
+    /* Inline assembly: asm("hex bytes"); */
+    if (t.kind == TOK_ASM) {
+        consume(p); /* consume 'asm' */
+        expect(p, TOK_LPAREN);
+        Token str = expect(p, TOK_STRING_LIT);
+        expect(p, TOK_RPAREN);
+        expect(p, TOK_SEMICOLON);
+        ASTNode *n = ast_new(AST_ASM, t.line, t.col);
+        n->as.unary.op = 0;
+        n->as.unary.expr = ast_string(str.val.str_val, str.line, str.col);
+        return n;
+    }
+
     /* Expression statement */
     ASTNode *expr = parse_expr(p);
     expect(p, TOK_SEMICOLON);
