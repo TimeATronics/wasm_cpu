@@ -4,6 +4,10 @@
 #include <string.h>
 #include <stdio.h>
 
+/* forward declarations */
+static void emit_init_block(Codegen *cg, ASTNode *init, int base_offset, SymTable *st);
+static void emit_init_block_global(Codegen *cg, ASTNode *init, int base_offset, SymTable *st);
+
 /* helpers */
 
 void codegen_init(Codegen *cg) {
@@ -757,6 +761,24 @@ static void codegen_expr(Codegen *cg, ASTNode *node, SymTable *st) {
                         emit_push(cg, (uint32_t)addr);
                         emit_op(cg, OP_SWAP);
                         emit_op(cg, OP_STORE);  /* store lo at addr */
+                    } else if (s->type && (s->type->kind == TYPE_STRUCT || s->type->kind == TYPE_UNION)) {
+                        /* Struct/union: rvalue is the address of temp. Copy word by word. */
+                        int sz = type_sizeof(s->type);
+                        int ws = (sz + 3) / 4;
+                        int addr = sym_addr(s);
+                        for (int i = ws - 1; i >= 0; i--) {
+                            emit_op(cg, OP_DUP);
+                            emit_push(cg, (uint32_t)i);
+                            emit_op(cg, OP_ADD);
+                            emit_op(cg, OP_LOAD);
+                            emit_push(cg, (uint32_t)(addr + i));
+                            emit_op(cg, OP_SWAP);
+                            emit_op(cg, OP_STORE);
+                        }
+                        emit_op(cg, OP_DROP);
+                        emit_push(cg, (uint32_t)addr);
+                        emit_op(cg, OP_LOAD);
+                        emit_op(cg, OP_DUP);
                     } else {
                         emit_op(cg, OP_DUP);
                         emit_push(cg, (uint32_t)sym_addr(s));
@@ -767,6 +789,25 @@ static void codegen_expr(Codegen *cg, ASTNode *node, SymTable *st) {
                     emit_local_set(cg, sym_addr(s) + 1);
                     emit_local_get(cg, sym_addr(s) + 1);
                     emit_local_get(cg, sym_addr(s));
+                } else if (s->type && (s->type->kind == TYPE_STRUCT || s->type->kind == TYPE_UNION)) {
+                    /* Struct/union: rvalue is address of temp. Copy word by word. */
+                    int sz = type_sizeof(s->type);
+                    int ws = (sz + 3) / 4;
+                    int addr = sym_addr(s);
+                    for (int i = ws - 1; i >= 0; i--) {
+                        emit_op(cg, OP_DUP);
+                        emit_push(cg, (uint32_t)i);
+                        emit_op(cg, OP_ADD);
+                        emit_op(cg, OP_LOAD);
+                        emit_op(cg, OP_GET_FP);
+                        emit_push(cg, (uint32_t)(addr + i));
+                        emit_op(cg, OP_ADD);
+                        emit_op(cg, OP_STORE);
+                    }
+                    emit_op(cg, OP_DROP);
+                    emit_op(cg, OP_GET_FP);
+                    emit_push(cg, (uint32_t)addr);
+                    emit_op(cg, OP_ADD);
                 } else {
                     emit_local_set(cg, sym_addr(s));
                     emit_local_get(cg, sym_addr(s));
@@ -1320,6 +1361,49 @@ static void codegen_expr(Codegen *cg, ASTNode *node, SymTable *st) {
         break;
     }
 
+    case AST_COMPOUND_LIT: {
+        Type *cty = node->type;
+        int type_sz = type_sizeof(cty);
+        int slots = (type_sz + 3) / 4;
+        if (slots < 1) slots = 1;
+        int temp_offset = cg->next_var_addr;
+        cg->next_var_addr += slots;
+        ASTNode *init = node->as.unary.expr;
+        if (init && init->kind == AST_BLOCK && cty &&
+            (cty->kind == TYPE_STRUCT || cty->kind == TYPE_UNION)) {
+            Member *m = cty->members;
+            for (int i = 0; i < init->as.block.count && m; i++, m = m->next) {
+                if (init->as.block.stmts[i]->kind == AST_BLOCK) {
+                    emit_init_block(cg, init->as.block.stmts[i],
+                                    temp_offset + m->offset / 4, st);
+                } else {
+                    codegen_expr(cg, init->as.block.stmts[i], st);
+                    emit_op(cg, OP_GET_FP);
+                    emit_push(cg, (uint32_t)(temp_offset + m->offset / 4));
+                    emit_op(cg, OP_ADD);
+                    emit_op(cg, OP_STORE);
+                }
+            }
+        } else if (init && init->kind == AST_BLOCK && cty &&
+                   cty->kind == TYPE_ARRAY) {
+            emit_init_block(cg, init, temp_offset, st);
+        } else if (init) {
+            codegen_expr(cg, init, st);
+            emit_op(cg, OP_GET_FP);
+            emit_push(cg, (uint32_t)temp_offset);
+            emit_op(cg, OP_ADD);
+            emit_op(cg, OP_STORE);
+        }
+        emit_op(cg, OP_GET_FP);
+        emit_push(cg, (uint32_t)temp_offset);
+        emit_op(cg, OP_ADD);
+        if (cty && cty->kind != TYPE_STRUCT && cty->kind != TYPE_UNION &&
+            cty->kind != TYPE_ARRAY) {
+            emit_op(cg, OP_LOAD);
+        }
+        break;
+    }
+
     default:
         fprintf(stderr, "s32-cc: unhandled expr kind %d at line %d\n",
                 node->kind, node->line);
@@ -1474,6 +1558,26 @@ static void codegen_stmt(Codegen *cg, ASTNode *node, SymTable *st) {
                         emit_op(cg, OP_STORE);
                         m = m->next;
                     }
+                } else if (node->as.var_decl.init->kind == AST_COMPOUND_LIT &&
+                           node->as.var_decl.type &&
+                           (node->as.var_decl.type->kind == TYPE_STRUCT ||
+                            node->as.var_decl.type->kind == TYPE_UNION)) {
+                    /* Compound literal init for struct: copy temp to local */
+                    codegen_expr(cg, node->as.var_decl.init, st);
+                    int sz = type_sizeof(node->as.var_decl.type);
+                    int ws = (sz + 3) / 4;
+                    int addr = sym_addr(s);
+                    for (int i = ws - 1; i >= 0; i--) {
+                        emit_op(cg, OP_DUP);
+                        emit_push(cg, (uint32_t)i);
+                        emit_op(cg, OP_ADD);
+                        emit_op(cg, OP_LOAD);
+                        emit_op(cg, OP_GET_FP);
+                        emit_push(cg, (uint32_t)(addr + i));
+                        emit_op(cg, OP_ADD);
+                        emit_op(cg, OP_STORE);
+                    }
+                    emit_op(cg, OP_DROP);
                 } else {
                     codegen_expr(cg, node->as.var_decl.init, st);
                     if (node->as.var_decl.type && (node->as.var_decl.type->kind == TYPE_DOUBLE || node->as.var_decl.type->kind == TYPE_LONG)) {

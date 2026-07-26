@@ -12,6 +12,7 @@ typedef struct TypedefEntry TypedefEntry;
 static TypedefEntry *typedefs;
 static void typedef_add(const char *name, Type *type);
 static Type *typedef_lookup(const char *name);
+static ASTNode *parse_initializer_list(Parser *p, Type *ty, int sl, int sc);
 
 /* Simplified type inference */
 
@@ -130,6 +131,7 @@ static ASTNode *parse_expr_with_bp(Parser *p, int min_bp);
 static ASTNode *parse_stmt(Parser *p);
 static ASTNode *parse_block_item(Parser *p);
 static ASTNode *parse_decl(Parser *p, SymTable *st);
+static ASTNode *parse_initializer_list(Parser *p, Type *ty, int sl, int sc);
 
 /* Parse a type specifier - chibicc-style bit-counter approach */
 static Type *parse_type(Parser *p) {
@@ -559,6 +561,14 @@ static ASTNode *parse_primary(Parser *p) {
             }
             if (check(p, TOK_RPAREN)) {
                 consume(p);
+                /* Compound literal: (struct S){1,2} or (int[3]){1,2,3} */
+                if (check(p, TOK_LBRACE)) {
+                    ASTNode *init = parse_initializer_list(p, cty, t.line, t.col);
+                    ASTNode *n = ast_new(AST_COMPOUND_LIT, t.line, t.col);
+                    n->type = cty;
+                    n->as.unary.expr = init;
+                    return n;
+                }
                 ASTNode *operand = parse_expr_with_bp(p, 14);
                 ASTNode *n = ast_new(AST_CAST, t.line, t.col);
                 n->as.unary.expr = operand;

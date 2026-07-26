@@ -19,7 +19,7 @@ typedef enum {
     AST_NULL_STMT, AST_VAR_DECL, AST_FUNC_DECL, AST_ASM,
     AST_LABEL, AST_GOTO,
     /* Misc */
-    AST_SWITCH, AST_CASE, AST_DEFAULT,
+    AST_SWITCH, AST_CASE, AST_DEFAULT, AST_COMPOUND_LIT,
 } ASTKind;
 
 typedef enum {
