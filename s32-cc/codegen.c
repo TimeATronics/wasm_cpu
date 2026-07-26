@@ -1328,6 +1328,67 @@ static void codegen_expr(Codegen *cg, ASTNode *node, SymTable *st) {
     }
 }
 
+/* Emit init for a block initializer (local vars, uses fp+offset) */
+static void emit_init_block(Codegen *cg, ASTNode *init, int base_offset, SymTable *st) {
+    if (!init || init->kind != AST_BLOCK) return;
+    int auto_idx = 0;
+    for (int i = 0; i < init->as.block.count; i++) {
+        ASTNode *item = init->as.block.stmts[i];
+        if (item->kind == AST_INT_LIT && item->as.int_val == -1 &&
+            i + 2 < init->as.block.count) {
+            ASTNode *idx_node = init->as.block.stmts[i+1];
+            ASTNode *val_node = init->as.block.stmts[i+2];
+            int idx = idx_node->as.int_val;
+            if (val_node->kind == AST_BLOCK)
+                emit_init_block(cg, val_node, base_offset + idx, st);
+            else {
+                codegen_expr(cg, val_node, st);
+                emit_op(cg, OP_GET_FP); emit_push(cg, (uint32_t)(base_offset + idx));
+                emit_op(cg, OP_ADD); emit_op(cg, OP_STORE);
+            }
+            i += 2; if (idx >= auto_idx) auto_idx = idx + 1;
+            continue;
+        }
+        if (item->kind == AST_BLOCK) {
+            emit_init_block(cg, item, base_offset + auto_idx, st);
+            auto_idx++; continue;
+        }
+        codegen_expr(cg, item, st);
+        emit_op(cg, OP_GET_FP); emit_push(cg, (uint32_t)(base_offset + auto_idx));
+        emit_op(cg, OP_ADD); emit_op(cg, OP_STORE);
+        auto_idx++;
+    }
+}
+/* Emit init for global (absolute addressing, uses push+store) */
+static void emit_init_block_global(Codegen *cg, ASTNode *init, int base_offset, SymTable *st) {
+    if (!init || init->kind != AST_BLOCK) return;
+    int auto_idx = 0;
+    for (int i = 0; i < init->as.block.count; i++) {
+        ASTNode *item = init->as.block.stmts[i];
+        if (item->kind == AST_INT_LIT && item->as.int_val == -1 &&
+            i + 2 < init->as.block.count) {
+            ASTNode *idx_node = init->as.block.stmts[i+1];
+            ASTNode *val_node = init->as.block.stmts[i+2];
+            int idx = idx_node->as.int_val;
+            if (val_node->kind == AST_BLOCK)
+                emit_init_block_global(cg, val_node, base_offset + idx, st);
+            else {
+                codegen_expr(cg, val_node, st);
+                emit_push(cg, (uint32_t)(base_offset + idx)); emit_op(cg, OP_STORE);
+            }
+            i += 2; if (idx >= auto_idx) auto_idx = idx + 1;
+            continue;
+        }
+        if (item->kind == AST_BLOCK) {
+            emit_init_block_global(cg, item, base_offset + auto_idx, st);
+            auto_idx++; continue;
+        }
+        codegen_expr(cg, item, st);
+        emit_push(cg, (uint32_t)(base_offset + auto_idx)); emit_op(cg, OP_STORE);
+        auto_idx++;
+    }
+}
+
 /* Statement codegen */
 
 static void codegen_stmt(Codegen *cg, ASTNode *node, SymTable *st);
@@ -1399,14 +1460,7 @@ static void codegen_stmt(Codegen *cg, ASTNode *node, SymTable *st) {
                     }
                 } else if (node->as.var_decl.init->kind == AST_BLOCK &&
                            node->as.var_decl.type && node->as.var_decl.type->kind == TYPE_ARRAY) {
-                    /* Initializer list: { val1, val2, ... } */
-                    for (int i = 0; i < node->as.var_decl.init->as.block.count; i++) {
-                        codegen_expr(cg, node->as.var_decl.init->as.block.stmts[i], st);
-                        emit_op(cg, OP_GET_FP);
-                        emit_push(cg, (uint32_t)(sym_addr(s) + i));
-                        emit_op(cg, OP_ADD);
-                        emit_op(cg, OP_STORE);
-                    }
+                    emit_init_block(cg, node->as.var_decl.init, sym_addr(s), st);
                 } else if (node->as.var_decl.init->kind == AST_BLOCK &&
                            node->as.var_decl.type && 
                            (node->as.var_decl.type->kind == TYPE_STRUCT || node->as.var_decl.type->kind == TYPE_UNION)) {
@@ -2017,9 +2071,16 @@ void codegen_program(Codegen *cg, ASTNode *node, FILE *out) {
         if (d && d->kind == AST_VAR_DECL) {
             Symbol *s = symtable_lookup(top, d->as.var_decl.name);
             if (s && d->as.var_decl.init) {
-                codegen_expr(cg, d->as.var_decl.init, top);
-                emit_push(cg, (uint32_t)sym_addr(s));
-                emit_op(cg, OP_STORE);
+                if (d->as.var_decl.init->kind == AST_BLOCK &&
+                    (d->as.var_decl.type->kind == TYPE_ARRAY ||
+                     d->as.var_decl.type->kind == TYPE_STRUCT ||
+                     d->as.var_decl.type->kind == TYPE_UNION))
+                    emit_init_block_global(cg, d->as.var_decl.init, sym_addr(s), top);
+                else {
+                    codegen_expr(cg, d->as.var_decl.init, top);
+                    emit_push(cg, (uint32_t)sym_addr(s));
+                    emit_op(cg, OP_STORE);
+                }
             }
         }
         /* Initialize static locals inside function bodies */

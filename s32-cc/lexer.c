@@ -293,9 +293,10 @@ Token lexer_next(Lexer *lex) {
         return t;
     }
 
-    /* Char literal */
-    if (c == '\'') {
-        next_ch(lex);
+    /* Char literal (also handles L'x' wide char prefix) */
+    if (c == '\'' || (c == 'L' && lex->buf_pos + 1 < lex->buf_len && lex->buf[lex->buf_pos + 1] == '\'')) {
+        if (c == 'L') next_ch(lex); /* skip L prefix */
+        next_ch(lex); /* skip opening ' */
         char ch = next_ch(lex);
         if (ch == '\\') {
             char esc = next_ch(lex);
@@ -368,11 +369,11 @@ Token lexer_next(Lexer *lex) {
                 return t;
             }
             
-            /* Integer literal with possible suffix */
+            /* Handle suffixes: u, l, ll, ul, lu */
             bool is_long = false;
             if (peek_ch(lex) == 'u' || peek_ch(lex) == 'U') next_ch(lex);
             if (peek_ch(lex) == 'l' || peek_ch(lex) == 'L') { next_ch(lex); is_long = true; }
-            if (!is_long && (peek_ch(lex) == 'l' || peek_ch(lex) == 'L')) { next_ch(lex); is_long = true; }
+            if (peek_ch(lex) == 'l' || peek_ch(lex) == 'L') next_ch(lex); /* second l for ll */
             Token t = make_token(TOK_INT_LIT, sl, sc);
             if (is_long) {
                 t.is_long_lit = true;

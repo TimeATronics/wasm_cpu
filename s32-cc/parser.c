@@ -1049,7 +1049,23 @@ static ASTNode *parse_initializer_list(Parser *p, Type *ty, int sl, int sc) {
     int count = 0, cap = 0;
     while (!check(p, TOK_RBRACE)) {
         if (count >= cap) { cap = cap ? cap * 2 : 16; items = realloc(items, sizeof(ASTNode*) * cap); }
-        if (check(p, TOK_LBRACE))
+        /* Handle designated initializer: [index] = value */
+        if (check(p, TOK_LBRACKET)) {
+            consume(p); /* '[' */
+            ASTNode *idx = parse_expr(p);
+            expect(p, TOK_RBRACKET);
+            expect(p, TOK_ASSIGN);
+            ASTNode *val;
+            if (check(p, TOK_LBRACE))
+                val = parse_initializer_list(p, ty, sl, sc);
+            else
+                val = parse_expr_with_bp(p, 2);
+            /* Mark as designated: store sentinel (-1) then idx then val */
+            ASTNode *sentinel = ast_int(-1, sl, sc);
+            items[count++] = sentinel;
+            items[count++] = idx;
+            items[count++] = val;
+        } else if (check(p, TOK_LBRACE))
             items[count++] = parse_initializer_list(p, ty, sl, sc);
         else
             items[count++] = parse_expr_with_bp(p, 2);
