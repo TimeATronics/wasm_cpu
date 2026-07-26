@@ -680,6 +680,20 @@ static void codegen_expr(Codegen *cg, ASTNode *node, SymTable *st) {
                 emit_push(cg, (uint32_t)(node->as.unary.expr->as.member.member->offset / 4));
                 emit_op(cg, OP_ADD);
             }
+        } else if (node->as.unary.expr->kind == AST_INDEX) {
+            /* &arr[i]: compute address without load */
+            ASTNode *idx = node->as.unary.expr;
+            codegen_expr(cg, idx->as.index.base, st);
+            codegen_expr(cg, idx->as.index.index, st);
+            if (idx->type) {
+                int ws = (type_sizeof(idx->type) + 3) / 4;
+                if (ws > 1) {
+                    emit_push(cg, (uint32_t)(ws == 2 ? 1 : 2));
+                    for (int k = 0; k < (ws == 2 ? 1 : ws == 4 ? 2 : 0); k++) emit_op(cg, OP_SHL);
+                    if (ws != 2 && ws != 4) { emit_push(cg, (uint32_t)ws); emit_op(cg, OP_MUL); }
+                }
+            }
+            emit_op(cg, OP_ADD);
         } else {
             fprintf(stderr, "s32-cc: & operator not supported for this expression\n");
             emit_push(cg, 0);

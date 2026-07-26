@@ -1145,34 +1145,43 @@ static ASTNode *parse_decl(Parser *p, SymTable *st) {
             }
             expect(p, TOK_RPAREN); /* close '(' from complex declarator */
             ty = inner_ty;
-            /* After ')' check for outer modifiers: [size] or (params) */
+            /* Outer modifiers [size] or (params) apply to the inner base,
+             * not the outer pointer. For (*a)[3]: inner_base=int, apply [3]→array[3]of int,
+             * then pointer→pointer to array[3]of int */
             while (vname && (check(p, TOK_LBRACKET) || check(p, TOK_LPAREN))) {
                 if (check(p, TOK_LBRACKET)) {
                     consume(p);
                     int arr_size = 0;
                     if (check(p, TOK_INT_LIT)) arr_size = consume(p).val.int_val;
                     expect(p, TOK_RBRACKET);
-                    ty = type_array(ty, arr_size);
+                    /* For (*a)[N]: wrap the pointer's base, not the pointer itself */
+                    if (inner_ty->kind == TYPE_PTR) {
+                        inner_ty->base = type_array(inner_ty->base, arr_size);
+                    } else {
+                        ty = type_array(ty, arr_size);
+                    }
                 } else {
                     consume(p); /* consume '(' */
                     Type **param_types = NULL;
-                    int param_count = 0, param_cap = 0;
+                    int pc = 0, pcap = 0;
                     if (!check(p, TOK_RPAREN)) {
                         do {
                             Type *pty = parse_type(p);
                             char *pname = NULL;
                             if (check(p, TOK_IDENT)) pname = consume(p).val.str_val;
                             if (pty->kind == TYPE_VOID && !pname && check(p, TOK_RPAREN)) break;
-                            if (param_count >= param_cap) {
-                                param_cap = param_cap ? param_cap * 2 : 4;
-                                param_types = realloc(param_types, sizeof(Type*) * param_cap);
-                            }
-                            param_types[param_count++] = pty;
+                            if (pc >= pcap) { pcap = pcap ? pcap * 2 : 4; param_types = realloc(param_types, sizeof(Type*)*pcap); }
+                            param_types[pc++] = pty;
                         } while (check(p, TOK_COMMA) && (consume(p), 1));
                     }
                     expect(p, TOK_RPAREN);
-                    ty = type_func(ty, param_types, param_count, false);
-                    ty->param_count = param_count;
+                    if (inner_ty->kind == TYPE_PTR) {
+                        inner_ty->base = type_func(inner_ty->base, param_types, pc, false);
+                        if (inner_ty->base) inner_ty->base->param_count = pc;
+                    } else {
+                        ty = type_func(ty, param_types, pc, false);
+                        if (ty) ty->param_count = pc;
+                    }
                 }
             }
         }
@@ -1211,15 +1220,27 @@ static ASTNode *parse_decl(Parser *p, SymTable *st) {
             do {
                 Type *pty = parse_type(p);
                 char *pname = NULL;
-                if (check(p, TOK_IDENT)) {
+                if (check(p, TOK_LPAREN)) {
+                    /* Complex declarator in param: int (*a)[3] */
+                    consume(p);
+                    while (check(p, TOK_STAR)) consume(p); /* skip pointers */
+                    if (check(p, TOK_IDENT)) pname = consume(p).val.str_val;
+                    expect(p, TOK_RPAREN);
+                    /* Skip outer modifiers like [3] */
+                    while (check(p, TOK_LBRACKET)) {
+                        consume(p);
+                        if (check(p, TOK_INT_LIT)) consume(p);
+                        expect(p, TOK_RBRACKET);
+                    }
+                } else if (check(p, TOK_IDENT)) {
                     pname = consume(p).val.str_val;
                 }
                 /* (void) means no parameters in C */
                 if (pty->kind == TYPE_VOID && !pname && check(p, TOK_RPAREN)) {
                     break;
                 }
-                /* Handle array declarator in params: int x[100] → int *x */
-                if (check(p, TOK_LBRACKET)) {
+                /* Handle array declarator in params: int x[100] → int *x, int x[2][3] → int (*)[3] */
+                while (check(p, TOK_LBRACKET)) {
                     consume(p);
                     if (check(p, TOK_INT_LIT)) consume(p); /* skip size */
                     expect(p, TOK_RBRACKET);
