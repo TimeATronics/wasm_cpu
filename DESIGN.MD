@@ -386,12 +386,27 @@ Our compiler source uses only 4 features that could block self-compilation:
 
 ## 9. Summary
 
-### Currently Implemented: ~85% of compiler, ~100% of ISA
+### Currently Implemented
+- **ISA**: 100% - all 52 opcodes implemented in simulator
+- **Simulator**: Ring buffer instruction trace, ELF entry point support, real-time UART output, store8 MMIO routing
+- **Assembler**: Full two-pass assembler with ELF object output
+- **Linker**: ELF linker with conditional _start patching
+- **Compiler** (feature/s32_cc branch): ~85% of C, minimal kernel boots ("xv6-s32 booting" printed successfully)
+- **FPGA**: Verilog for Tang Nano 9K (top.v, stack_cpu.v, flash.v, uart_tx/rx, bram_stack, simple_ram)
 
-### Remaining for Self-Bootstrapping: 3 features to verify/fix (low effort)
+### Branch Structure
+- `main`: Verilog + simulator + assembler + shared runtime + scripts
+- `feature/s32_cc`: Full toolchain including C compiler (s32-cc), linker (s32-ld), xv6-s32 kernel port
 
-### Remaining for Test Suite Coverage: ~12 features (medium effort)
+### Recent Fixes (feature/s32_cc)
+- csr_write dummy return value, tlb_flush built-in
+- String literal pre-scan and address separation from variables
+- Simulator trace dump on crash, real-time UART output
+- Linker conditional _start frame_size patching
+- Combined single-file compilation for kernel
 
-### Remaining for Kernel: ~6 critical features + MMU implementation (high effort)
-
-### Remaining for Shell: ~6 OS syscalls + filesystem (very high effort)
+### Remaining for Kernel (on feature/s32_cc)
+- printint/printptr have codegen stack depth bugs (shift/div/mul ops)
+- swtch context switch needs proper implementation
+- kalloc/acquire loops may have codegen issues
+- ~6 critical features + MMU for full xv6 parity
