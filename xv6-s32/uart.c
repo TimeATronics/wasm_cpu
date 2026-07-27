@@ -1,9 +1,10 @@
 #include "types.h"
 #include "defs.h"
 #include "s32.h"
+#include "memlayout.h"
 
-volatile unsigned char *uart;
-volatile unsigned char *uart_status;
+unsigned char *uart;
+unsigned char *uart_status;
 
 #define UART_TX     0x00
 #define UART_RX     0x04
@@ -13,8 +14,8 @@ volatile unsigned char *uart_status;
 #define STAT_RX_RDY 0x02
 
 void uartinit(void) {
-    uart = (volatile unsigned char*)UART0;
-    uart_status = (volatile unsigned char*)(UART0 + UART_STAT);
+    uart = (unsigned char*)UART0;
+    uart_status = (unsigned char*)(UART0 + UART_STAT);
 }
 
 void uartputc_sync(int c) {

@@ -1,9 +1,8 @@
-void puts(char *s);
 void halt(void);
+void csr_write(unsigned int id, unsigned int val);
 
 int main(void) {
-    puts("\nxv6-s32 kernel booting");
-    puts("xv6-s32 kernel ready");
+    csr_write(0, 1);
     halt();
     return 0;
 }

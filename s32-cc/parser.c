@@ -505,6 +505,7 @@ static ASTNode *parse_primary(Parser *p) {
         if (nk == TOK_INT || nk == TOK_CHAR || nk == TOK_VOID ||
             nk == TOK_LONG || nk == TOK_SHORT ||
             nk == TOK_UNSIGNED || nk == TOK_SIGNED ||
+            nk == TOK_CONST || nk == TOK_VOLATILE ||
             nk == TOK_ENUM || nk == TOK_DOUBLE || nk == TOK_FLOAT ||
             nk == TOK_STRUCT || nk == TOK_UNION ||
             (nk == TOK_IDENT && typedef_lookup(peek(p).val.str_val))) {
@@ -523,6 +524,7 @@ static ASTNode *parse_primary(Parser *p) {
                     if (nk == TOK_INT || nk == TOK_CHAR || nk == TOK_VOID ||
                         nk == TOK_LONG || nk == TOK_SHORT || 
                         nk == TOK_UNSIGNED || nk == TOK_SIGNED ||
+                        nk == TOK_CONST || nk == TOK_VOLATILE ||
                         nk == TOK_DOUBLE || nk == TOK_FLOAT ||
                         nk == TOK_STRUCT || nk == TOK_UNION) {
                         break; /* nested cast, let expression parser handle it */
@@ -598,6 +600,7 @@ static ASTNode *parse_primary(Parser *p) {
             if (nk == TOK_INT || nk == TOK_CHAR || nk == TOK_VOID ||
                 nk == TOK_LONG || nk == TOK_SHORT ||
                 nk == TOK_UNSIGNED || nk == TOK_SIGNED ||
+                nk == TOK_CONST || nk == TOK_VOLATILE ||
                 nk == TOK_ENUM || nk == TOK_STRUCT || nk == TOK_UNION || nk == TOK_DOUBLE || nk == TOK_FLOAT ||
                 (nk == TOK_IDENT && typedef_lookup(peek(p).val.str_val))) {
                 /* sizeof(type) */
@@ -871,6 +874,7 @@ static ASTNode *parse_stmt(Parser *p) {
             if (ft.kind == TOK_INT || ft.kind == TOK_CHAR || ft.kind == TOK_VOID ||
                 ft.kind == TOK_LONG || ft.kind == TOK_SHORT ||
                 ft.kind == TOK_UNSIGNED || ft.kind == TOK_SIGNED ||
+                ft.kind == TOK_CONST || ft.kind == TOK_VOLATILE ||
                 ft.kind == TOK_ENUM || ft.kind == TOK_DOUBLE || ft.kind == TOK_FLOAT ||
                 ft.kind == TOK_STRUCT || ft.kind == TOK_UNION ||
                 ft.kind == TOK_STATIC || ft.kind == TOK_EXTERN || ft.kind == TOK_TYPEDEF ||

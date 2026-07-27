@@ -83,7 +83,7 @@ struct proc *allocproc(void) {
 found:
   p->pid = allocpid();
   p->state = USED;
-  p->kstack = KSTACK(p - proc);
+  p->kstack = TRAPFRAME - (((p - proc) + 1) * 128);
   p->sz = 0;
   p->parent = 0;
   p->killed = 0;
@@ -139,7 +139,7 @@ void procinit(void) {
   for (p = proc; p < &proc[NPROC]; p++) {
     initlock(&p->lock, "proc");
     p->state = UNUSED;
-    p->kstack = KSTACK(p - proc);
+  p->kstack = TRAPFRAME - (((p - proc) + 1) * 128);
   }
   mycpu()->proc = 0;
 }
@@ -190,7 +190,8 @@ void kexit(int status) {
 
 int kwait(int *status) {
   struct proc *np;
-  int havekids, pid;
+  int havekids;
+  int pid;
   struct proc *p = myproc();
 
   acquire(&p->lock);

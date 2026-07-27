@@ -13,7 +13,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-ROOT = Path(__file__).parent
+ROOT = Path(__file__).parent.parent
 S32_CC = ROOT / "s32-cc" / "s32-cc.exe"
 S32_LD = ROOT / "s32-ld" / "s32-ld.exe"
 S32_AS = ROOT / "s32-as" / "s32-as.exe"

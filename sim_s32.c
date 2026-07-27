@@ -118,6 +118,49 @@ typedef struct {
     size_t   output_len;
 } cpu_t;
 
+/* ── Ring-buffer instruction trace ──────────────────────────────── */
+
+#define TRACE_SIZE  256
+typedef struct {
+    uint32_t pc;
+    uint8_t  opcode;
+    int      dsp;
+    int      rsp;
+    uint32_t top_val;
+} TraceEntry;
+
+static TraceEntry trace_buf[TRACE_SIZE];
+static int trace_idx = 0;
+
+static void trace_record(cpu_t *cpu, uint8_t opcode) {
+    trace_buf[trace_idx] = (TraceEntry){
+        .pc = cpu->pc, .opcode = opcode,
+        .dsp = cpu->dsp, .rsp = cpu->rsp,
+        .top_val = (cpu->dsp > 0) ? cpu->data_stack[cpu->dsp - 1] : 0
+    };
+    trace_idx = (trace_idx + 1) % TRACE_SIZE;
+}
+
+static void dump_trace(void) {
+    fprintf(stderr, "\n=== LAST %d INSTRUCTIONS ===\n", TRACE_SIZE);
+    fprintf(stderr, "  PC      | Opcode       | DSP | RSP | Top\n");
+    fprintf(stderr, "----------+--------------+-----+-----+--------\n");
+    for (int i = 0; i < TRACE_SIZE; i++) {
+        TraceEntry *e = &trace_buf[(trace_idx + i) % TRACE_SIZE];
+        if (e->opcode == 0) continue;
+        const char *name = opcode_names[e->opcode];
+        fprintf(stderr, "0x%08X | %-12s | %3d | %3d | 0x%x\n",
+                e->pc, name ? name : "???", e->dsp, e->rsp, e->top_val);
+    }
+    fprintf(stderr, "============================\n\n");
+}
+
+static void fatal(cpu_t *cpu, const char *msg) {
+    fprintf(stderr, "%s at PC=0x%08X (step %llu)\n", msg, cpu->pc, (unsigned long long)cpu->steps);
+    dump_trace();
+    exit(1);
+}
+
 /* ── Helpers ───────────────────────────────────────────────────── */
 
 static inline uint32_t to_unsigned(int32_t v) { return (uint32_t)v; }
@@ -126,34 +169,26 @@ static inline int32_t  to_signed(uint32_t v) {
 }
 
 static inline void push(cpu_t *cpu, uint32_t val) {
-    if (cpu->dsp >= MAX_STACK) {
-        fprintf(stderr, "Data stack overflow at PC=0x%08X\n", cpu->pc);
-        exit(1);
-    }
+    if (cpu->dsp >= MAX_STACK)
+        fatal(cpu, "Data stack overflow");
     cpu->data_stack[cpu->dsp++] = val;
 }
 
 static inline uint32_t pop(cpu_t *cpu) {
-    if (cpu->dsp == 0) {
-        fprintf(stderr, "Data stack underflow at PC=0x%08X\n", cpu->pc);
-        exit(1);
-    }
+    if (cpu->dsp == 0)
+        fatal(cpu, "Data stack underflow");
     return cpu->data_stack[--cpu->dsp];
 }
 
 static inline void rpush(cpu_t *cpu, uint32_t val) {
-    if (cpu->rsp >= MAX_RSP) {
-        fprintf(stderr, "Return stack overflow at PC=0x%08X\n", cpu->pc);
-        exit(1);
-    }
+    if (cpu->rsp >= MAX_RSP)
+        fatal(cpu, "Return stack overflow");
     cpu->return_stack[cpu->rsp++] = val;
 }
 
 static inline uint32_t rpop(cpu_t *cpu) {
-    if (cpu->rsp == 0) {
-        fprintf(stderr, "Return stack underflow at PC=0x%08X\n", cpu->pc);
-        exit(1);
-    }
+    if (cpu->rsp == 0)
+        fatal(cpu, "Return stack underflow");
     return cpu->return_stack[--cpu->rsp];
 }
 
@@ -231,9 +266,11 @@ static void mem_write(cpu_t *cpu, uint32_t addr, uint32_t val) {
     if (addr >= MMIO_BASE) {
         switch (addr) {
         case MMIO_UART_TX:
-            /* Output character */
-            if (cpu->output_len < sizeof(cpu->output) - 1) {
-                cpu->output[cpu->output_len++] = (char)(val & 0xFF);
+            /* Output character immediately (flush for interactive/debugging) */
+            {
+                char ch = (char)(val & 0xFF);
+                fputc(ch, stdout);
+                fflush(stdout);
             }
             return;
         case MMIO_TIMER_CMP:
@@ -365,10 +402,10 @@ static int execute(cpu_t *cpu, const uint8_t *program, size_t prog_len) {
         goto fetch_next;
     do_print: {
         uint32_t val = pop(cpu);
-        if (cpu->output_len < sizeof(cpu->output) - 1) {
-            cpu->output[cpu->output_len++] = (char)(val & 0xFF);
-        }
-        goto fetch_next;
+            /* Fall through - print opcode output immediately */
+            fputc((char)(val & 0xFF), stdout);
+            fflush(stdout);
+            goto fetch_next;
     }
     do_eq: {
         uint32_t b = pop(cpu), a = pop(cpu);
@@ -483,12 +520,17 @@ static int execute(cpu_t *cpu, const uint8_t *program, size_t prog_len) {
     }
     do_store8: {
         uint32_t addr = pop(cpu), val = pop(cpu);
-        uint32_t word_idx = (addr >> 2) & (RAM_WORDS - 1);
-        uint32_t byte_idx = addr & 3;
-        uint32_t old_word = cpu->ram[word_idx];
-        uint32_t mask = ~(0xFFu << (byte_idx * 8));
-        uint32_t new_word = (old_word & mask) | ((val & 0xFF) << (byte_idx * 8));
-        cpu->ram[word_idx] = new_word;
+        if (addr >= MMIO_BASE) {
+            /* MMIO byte write: use mem_write for UART TX */
+            mem_write(cpu, addr, val & 0xFF);
+        } else {
+            uint32_t word_idx = (addr >> 2) & (RAM_WORDS - 1);
+            uint32_t byte_idx = addr & 3;
+            uint32_t old_word = cpu->ram[word_idx];
+            uint32_t mask = ~(0xFFu << (byte_idx * 8));
+            uint32_t new_word = (old_word & mask) | ((val & 0xFF) << (byte_idx * 8));
+            cpu->ram[word_idx] = new_word;
+        }
         goto fetch_next;
     }
     do_local_get: {
@@ -621,6 +663,7 @@ static int execute(cpu_t *cpu, const uint8_t *program, size_t prog_len) {
         if (cpu->max_steps > 0 && cpu->steps >= cpu->max_steps) return 0;
         opcode = program[cpu->pc++];
         cpu->steps++;
+        trace_record(cpu, opcode);
         DISPATCH();
 }
 
@@ -694,11 +737,13 @@ int main(int argc, char **argv) {
     fclose(f);
 
     /* Detect and extract ELF executable .text segment */
+    uint32_t entry_pc = 0;
     if (file_size >= (long)sizeof(Elf32_Ehdr) &&
         program[EI_MAG0] == ELFMAG0 && program[EI_MAG1] == ELFMAG1 &&
         program[EI_MAG2] == ELFMAG2 && program[EI_MAG3] == ELFMAG3) {
         Elf32_Ehdr *ehdr = (Elf32_Ehdr *)program;
         if (ehdr->e_type == ET_EXEC && ehdr->e_phoff > 0 && ehdr->e_phnum > 0) {
+            entry_pc = ehdr->e_entry;
             /* Find PT_LOAD segment */
             Elf32_Phdr *phdr = (Elf32_Phdr *)(program + ehdr->e_phoff);
             uint32_t text_off = 0, text_size = 0;
@@ -747,6 +792,7 @@ int main(int argc, char **argv) {
     }
 
     /* Run */
+    cpu.pc = entry_pc;
     execute(&cpu, program, (size_t)file_size);
 
     /* Report results */

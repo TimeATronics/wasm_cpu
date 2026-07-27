@@ -6,7 +6,7 @@
 #include "proc.h"
 #include "defs.h"
 
-volatile static int started = 0;
+static int started = 0;
 
 void kernel_trap_entry(void);
 

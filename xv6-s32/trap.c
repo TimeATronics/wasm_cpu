@@ -38,7 +38,7 @@ int either_copyout(int user_dst, uint dst, void *src, int len) {
     char *s = (char*)src;
     int i;
     for (i = 0; i < len; i++) {
-        volatile char *p = (volatile char*)(dst + i);
+        char *p = (char*)(dst + i);
         *p = s[i];
     }
     return 0;
@@ -48,7 +48,7 @@ int either_copyin(void *dst, int user_src, uint src, int len) {
     char *d = (char*)dst;
     int i;
     for (i = 0; i < len; i++) {
-        volatile char *p = (volatile char*)(src + i);
+        char *p = (char*)(src + i);
         d[i] = *p;
     }
     return 0;

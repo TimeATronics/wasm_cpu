@@ -2,11 +2,11 @@
 #include "defs.h"
 #include "s32.h"
 
-volatile unsigned char *const ucsr = (volatile unsigned char*)0xFE000008;
+unsigned char *ucsr = (unsigned char*)0xFE000008;
 
 void consoleinit(void) {
     uartinit();
-    printk("xv6-s32 console: initialized\n");
+    printk("xv6-s32 console: initialized\n", 0, 0, 0, 0);
 }
 
 void consputc(int c) {
@@ -19,10 +19,12 @@ void consputc(int c) {
     }
 }
 
-struct {
+struct cons_t {
     struct spinlock lock;
     char buf[128];
-    uint r, w, e;
+    uint r;
+    uint w;
+    uint e;
 } cons;
 
 void consoleintr(int c) {

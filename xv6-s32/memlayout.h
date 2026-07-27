@@ -9,4 +9,3 @@
 #define RAMSIZE     (PHYSTOP - KERNBASE)
 
 #define TRAPFRAME   (PHYSTOP - 0x20)
-#define KSTACK(p)   (TRAPFRAME - ((p) + 1) * 0x80)

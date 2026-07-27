@@ -388,7 +388,8 @@ Token lexer_next(Lexer *lex) {
         /* Check for float literal (starts with digit or digit+'.' or '.'+digit) */
         bool is_float = (c == '.');
         
-        if (c == '0' && (peek_ch(lex) == 'x' || peek_ch(lex) == 'X')) {
+        if (c == '0' && lex->buf_pos + 1 < lex->buf_len &&
+            (lex->buf[lex->buf_pos + 1] == 'x' || lex->buf[lex->buf_pos + 1] == 'X')) {
             next_ch(lex); next_ch(lex);
             unsigned long val = 0;
             while (isxdigit(peek_ch(lex)))
