@@ -1,1 +1,0 @@
-s32-cc: line 1 col 29: expected 'token', got 'token'
