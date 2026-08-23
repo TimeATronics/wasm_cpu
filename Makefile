@@ -1,4 +1,4 @@
-.PHONY: all synth pnr pack program clean flash assemble flash_program
+.PHONY: all synth pnr pack program clean flash flash_program
 
 PROJECT = wasm_cpu
 TOP_MODULE = top
@@ -6,23 +6,16 @@ DEVICE = GW1NR-LV9QN88PC6/I5
 FAMILY = GW1N-9C
 BOARD = tangnano9k
 
-SOURCES = top.v stack_cpu.v uart_tx.v flash.v
+SOURCES = verilog/top.sv verilog/cpu_core.sv verilog/prog_bram.sv verilog/data_bram.sv verilog/boot_loader.sv uart_tx.v uart_rx.v
 CONSTRAINTS = tangnano9k.cst
 
 JSON = $(PROJECT).json
 PNR_JSON = $(PROJECT)_pnr.json
 BITSTREAM = $(PROJECT).fs
 
-PROGRAM_BIN = programs/demo.bin
-
 FREQ = 27
 
-all: assemble $(BITSTREAM)
-
-assemble: $(PROGRAM_BIN)
-
-$(PROGRAM_BIN): programs/demo.asm scripts/assembler.js
-	node scripts/assembler.js programs/demo.asm programs/demo
+all: synth pnr pack
 
 synth: $(JSON)
 
@@ -32,27 +25,19 @@ $(JSON): $(SOURCES)
 pnr: $(PNR_JSON)
 
 $(PNR_JSON): $(JSON) $(CONSTRAINTS)
-	nextpnr-gowin --json $(JSON) --write $(PNR_JSON) --freq $(FREQ) --device $(DEVICE) --family $(FAMILY) --cst $(CONSTRAINTS)
+	nextpnr-himbaechel --json $(JSON) --write $(PNR_JSON) --device $(DEVICE) --vopt family=$(FAMILY) --vopt cst=$(CONSTRAINTS)
 
 pack: $(BITSTREAM)
 
 $(BITSTREAM): $(PNR_JSON)
 	gowin_pack -d $(FAMILY) -o $(BITSTREAM) $(PNR_JSON)
 
-program: $(BITSTREAM) $(PROGRAM_BIN)
+program: $(BITSTREAM)
 	openFPGALoader -b $(BOARD) $(BITSTREAM)
 
-flash: $(BITSTREAM) $(PROGRAM_BIN)
+flash: $(BITSTREAM)
 	openFPGALoader -b $(BOARD) -f $(BITSTREAM)
-
-flash_program: $(PROGRAM_BIN)
-	openFPGALoader -b $(BOARD) --external-flash $(PROGRAM_BIN)
 
 clean:
 	rm -f $(JSON) $(PNR_JSON) $(BITSTREAM)
 	rm -f programs/*.hex programs/*.vh programs/*.bin
-
-monitor:
-	@echo "Opening serial monitor at 115200 baud..."
-	@echo "Use Ctrl+C to exit"
-	screen /dev/ttyUSB1 115200

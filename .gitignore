@@ -4,3 +4,9 @@
 refs/
 **/*.exe
 **/*.o
+**/*.fs
+**/*.json
+**/*.vcd
+**/*.vvp
+check_init*.py
+docs/

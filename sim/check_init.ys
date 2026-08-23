@@ -1,0 +1,5 @@
+read_verilog -sv verilog/prog_bram.sv
+hierarchy
+proc
+memory
+stat

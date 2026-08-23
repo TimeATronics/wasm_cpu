@@ -23,7 +23,7 @@
 
 /* ── Configuration ─────────────────────────────────────────────── */
 
-#define RAM_WORDS       1024          /* 4 KB default (matches sim.py) */
+#define RAM_WORDS       1280          /* 5 KB (1024 for RAM + 256 for OLED framebuffer) */
 #define RAM_BYTES        (RAM_WORDS * 4)
 #define MAX_STACK        256          /* data stack depth */
 #define MAX_RSP          256          /* return stack depth */
@@ -72,7 +72,7 @@ static const char *opcode_names[256] = {
     [0x39] = "local.get",[0x3A] = "local.set",
     [0x3B] = "sysenter", [0x3C] = "eret",
     [0x3D] = "csr_read", [0x3E] = "csr_write",[0x3F] = "tlb_flush",
-    [0x40] = "get_fp",
+    [0x40] = "get_fp",    [0x49] = "set_fp",
     [0x41] = "fadd",     [0x42] = "fsub",     [0x43] = "fmul",
     [0x44] = "fdiv",     [0x45] = "fcmp",     [0x46] = "f2i",
     [0x47] = "i2f",      [0x48] = "call_ind",
@@ -226,12 +226,12 @@ static uint8_t read_imm8(cpu_t *cpu, const uint8_t *program, size_t prog_len) {
 /* ── Memory access ─────────────────────────────────────────────── */
 
 static uint32_t ram_read(cpu_t *cpu, uint32_t addr) {
-    uint32_t idx = addr & (RAM_WORDS - 1);
+    uint32_t idx = (addr >> 2) & (RAM_WORDS - 1);
     return cpu->ram[idx];
 }
 
 static void ram_write(cpu_t *cpu, uint32_t addr, uint32_t val) {
-    uint32_t idx = addr & (RAM_WORDS - 1);
+    uint32_t idx = (addr >> 2) & (RAM_WORDS - 1);
     cpu->ram[idx] = val;
 }
 
@@ -340,6 +340,7 @@ static int execute(cpu_t *cpu, const uint8_t *program, size_t prog_len) {
         [0x3B] = &&do_sysenter,[0x3C] = &&do_eret,    [0x3D] = &&do_csr_read,
         [0x3E] = &&do_csr_write,[0x3F] = &&do_tlb_flush,
         [0x40] = &&do_get_fp,
+        [0x49] = &&do_set_fp,
         [0x41] = &&do_fadd,    [0x42] = &&do_fsub,    [0x43] = &&do_fmul,
         [0x44] = &&do_fdiv,    [0x45] = &&do_fcmp,    [0x46] = &&do_f2i,
         [0x47] = &&do_i2f,   [0x48] = &&do_call_ind,
@@ -507,7 +508,7 @@ static int execute(cpu_t *cpu, const uint8_t *program, size_t prog_len) {
         goto fetch_next;
     }
     do_store: {
-        uint32_t addr = pop(cpu), val = pop(cpu);
+        uint32_t addr = pop(cpu), val = peek(cpu, 0);
         mem_write(cpu, addr, val);
         goto fetch_next;
     }
@@ -519,8 +520,13 @@ static int execute(cpu_t *cpu, const uint8_t *program, size_t prog_len) {
         goto fetch_next;
     }
     do_store8: {
-        uint32_t addr = pop(cpu), val = pop(cpu);
-        if (addr >= MMIO_BASE) {
+        uint32_t addr = pop(cpu), val = peek(cpu, 0);
+        if (addr == 0x10000) {
+            /* Frame sync: dump OLED framebuffer to stdout */
+            unsigned long fb_start = 0x1000 / 4;
+            fwrite(&cpu->ram[fb_start], 1, 1024, stdout);
+            fflush(stdout);
+        } else if (addr >= MMIO_BASE) {
             /* MMIO byte write: use mem_write for UART TX */
             mem_write(cpu, addr, val & 0xFF);
         } else {
@@ -554,16 +560,11 @@ static int execute(cpu_t *cpu, const uint8_t *program, size_t prog_len) {
         goto fetch_next;
     do_call: {
         uint32_t target = read_imm32(cpu, program, prog_len);
-        uint32_t frame_size = rpop(cpu);
-        uint32_t old_fp = cpu->fp;
         rpush(cpu, cpu->pc);
-        rpush(cpu, old_fp);
-        cpu->fp = cpu->fp + frame_size;
         cpu->pc = target;
         goto fetch_next;
     }
     do_return:
-        cpu->fp = rpop(cpu);
         cpu->pc = rpop(cpu);
         goto fetch_next;
     do_key: {
@@ -618,6 +619,9 @@ static int execute(cpu_t *cpu, const uint8_t *program, size_t prog_len) {
     do_get_fp:
         push(cpu, cpu->fp);
         goto fetch_next;
+    do_set_fp:
+        cpu->fp = pop(cpu);
+        goto fetch_next;
 
     /* ── Floating point helpers ────────────────────────────────────── */
     /* Double values occupy 2 stack slots: [hi, lo] (hi on top).
@@ -644,12 +648,8 @@ static int execute(cpu_t *cpu, const uint8_t *program, size_t prog_len) {
     do_f2i:  { double v = POP_DOUBLE(); push(cpu, (uint32_t)(int32_t)v); goto fetch_next; }
     do_i2f:  { uint32_t v = pop(cpu); PUSH_DOUBLE((double)(int32_t)v); goto fetch_next; }
     do_call_ind: {
-        uint32_t target = pop(cpu);       /* target address from stack */
-        uint32_t frame_size = rpop(cpu);  /* frame_size from return stack */
-        uint32_t old_fp = cpu->fp;
+        uint32_t target = pop(cpu);
         rpush(cpu, cpu->pc);
-        rpush(cpu, old_fp);
-        cpu->fp = cpu->fp + frame_size;
         cpu->pc = target;
         goto fetch_next;
     }
@@ -839,6 +839,13 @@ int main(int argc, char **argv) {
         for (int i = 0; i < 32; i++) {
             fprintf(stderr, "  [%4d] 0x%08X\n", i, cpu.ram[i]);
         }
+    }
+
+    /* Dump OLED framebuffer (1024 bytes starting at byte-address 0x1000) */
+    {
+        unsigned long fb_start = 0x1000 / 4;
+        fwrite(&cpu.ram[fb_start], 1, 1024, stdout);
+        fflush(stdout);
     }
 
     free(program);
