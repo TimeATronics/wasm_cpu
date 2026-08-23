@@ -10,3 +10,6 @@ refs/
 **/*.vvp
 check_init*.py
 docs/
+AGENTS.md
+STACK_MACHINE_DESIGN.MD
+TDD.md
